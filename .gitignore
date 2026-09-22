@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+node_modules/
+dist/
+build/
+.DS_Store
+.idea/
+.vscode/
