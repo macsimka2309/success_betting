@@ -226,7 +226,7 @@ def test_import_writes_expected_rows(conn, source):
     run_all(conn, source)
     assert count(conn, "leagues") == 1
     assert count(conn, "league_seasons") == 2
-    assert count(conn, "teams") == 3
+    assert count(conn, "teams") == 3  # из матчей; события и статистика те же
     assert count(conn, "fixtures") == 2
     assert count(conn, "players") == 1
     assert count(conn, "fixture_events") == 1
@@ -239,6 +239,35 @@ def test_import_is_idempotent(conn, source):
     run_all(conn, source)
     after = {t: count(conn, t) for t in ("fixtures", "fixture_events", "teams")}
     assert before == after
+
+
+def test_team_only_in_events_is_added_to_reference(conn, source):
+    """В fixtures.parquet есть не все команды из событий (реальный случай)."""
+    write_parquet(
+        source / "events.parquet",
+        [
+            {
+                "fixture_id": 1001,
+                "minute": 30,
+                "minute_extra": None,
+                "team": "Неизвестная",
+                "team_id": 864.0,  # этой команды нет в fixtures.parquet
+                "type": "Card",
+                "detail": "Yellow Card",
+                "player": "X. Y.",
+                "player_id": 77.0,
+                "assist": None,
+                "comments": None,
+            }
+        ],
+    )
+    imp.import_leagues(conn, source, None, False)
+    imp.import_fixtures(conn, source, None, False)
+    imp.import_events(conn, source, None, False)
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM teams WHERE team_id = 864")
+        assert cur.fetchone() == ("Неизвестная",)
+    assert count(conn, "fixture_events") == 1
 
 
 def test_event_without_fixture_is_skipped(conn, source):
@@ -283,6 +312,30 @@ def test_fetch_state_marks_only_collected_sets(conn, source):
             "FROM fixture_fetch_state WHERE fixture_id = 1002"
         )
         assert cur.fetchone() == (None, None)
+
+
+def test_batches_are_committed_during_import(source):
+    """Пакеты фиксируются по ходу, а не одной транзакцией в конце.
+
+    Иначе обрыв переноса теряет всю работу (ПР-8). Проверяем тем, что
+    записанное видно ДРУГОМУ соединению, пока переносящее ещё открыто.
+    """
+    from src.db.connection import connect as open_connection
+
+    with psycopg.connect(TEST_URL) as setup:
+        with setup.cursor() as cur:
+            cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("CREATE SCHEMA public")
+        setup.commit()
+        migrate.run_up(setup)
+
+    with open_connection(TEST_URL) as importing:
+        imp.import_leagues(importing, source, None, False)
+        imp.import_fixtures(importing, source, None, False)
+        imp.import_events(importing, source, None, False)
+        with psycopg.connect(TEST_URL) as observer:
+            assert count(observer, "fixtures") == 2
+            assert count(observer, "fixture_events") == 1
 
 
 def test_dry_run_writes_nothing(conn, source):

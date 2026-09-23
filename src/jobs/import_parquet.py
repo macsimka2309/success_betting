@@ -430,6 +430,8 @@ def import_events(conn, source: Path, limit: int | None, dry_run: bool) -> list[
         return [events_report]
 
     known_fixtures = _existing_ids(conn, "fixtures", "fixture_id") if not dry_run else set()
+    teams_report = Report("команды из событий")
+    teams: dict[int, str] = {}
     players: dict[int, str] = {}
     event_rows: list[tuple] = []
     seen_keys: set[str] = set()
@@ -438,6 +440,12 @@ def import_events(conn, source: Path, limit: int | None, dry_run: bool) -> list[
     def flush() -> None:
         if dry_run:
             return
+        # Команды и игроки пишутся раньше событий: на них ссылаются внешние
+        # ключи. В fixtures.parquet есть не все команды, встречающиеся
+        # в событиях, поэтому справочник пополняется и отсюда.
+        if teams:
+            _write_teams(conn, teams, teams_report, dry_run)
+            teams.clear()
         if players:
             _write_players(conn, players, players_report)
             players.clear()
@@ -472,6 +480,10 @@ def import_events(conn, source: Path, limit: int | None, dry_run: bool) -> list[
                 events_report.skip("матч отсутствует в базе")
                 continue
 
+            team_id = to_int(row.get("team_id"))
+            if team_id is not None:
+                teams[team_id] = to_text(row.get("team")) or f"Команда {team_id}"
+
             player_id = to_int(row.get("player_id"))
             if player_id is not None:
                 players[player_id] = to_text(row.get("player")) or f"Игрок {player_id}"
@@ -493,7 +505,7 @@ def import_events(conn, source: Path, limit: int | None, dry_run: bool) -> list[
             event_rows.append(
                 (
                     fixture_id,
-                    to_int(row.get("team_id")),
+                    team_id,
                     to_int(row.get("minute")),
                     to_int(row.get("minute_extra")),
                     to_text(row.get("type")) or "unknown",
@@ -511,7 +523,7 @@ def import_events(conn, source: Path, limit: int | None, dry_run: bool) -> list[
             break
 
     flush()
-    return [players_report, events_report]
+    return [teams_report, players_report, events_report]
 
 
 def _write_players(conn, players: dict[int, str], report: Report) -> None:
@@ -536,7 +548,8 @@ def import_statistics(conn, source: Path, limit: int | None, dry_run: bool) -> l
         return [report]
 
     known_fixtures = _existing_ids(conn, "fixtures", "fixture_id") if not dry_run else set()
-    known_teams = _existing_ids(conn, "teams", "team_id") if not dry_run else set()
+    teams_report = Report("команды из статистики")
+    teams: dict[int, str] = {}
 
     columns = [
         "fixture_id",
@@ -552,12 +565,16 @@ def import_statistics(conn, source: Path, limit: int | None, dry_run: bool) -> l
     processed = 0
 
     def flush() -> None:
-        if dry_run or not rows:
+        if dry_run:
             return
-        report.written += write_batch(
-            conn, "fixture_statistics", columns, list(rows), "fixture_id, team_id"
-        )
-        rows.clear()
+        if teams:
+            _write_teams(conn, teams, teams_report, dry_run)
+            teams.clear()
+        if rows:
+            report.written += write_batch(
+                conn, "fixture_statistics", columns, list(rows), "fixture_id, team_id"
+            )
+            rows.clear()
 
     for batch in read_batches(path):
         for row in batch:
@@ -570,9 +587,7 @@ def import_statistics(conn, source: Path, limit: int | None, dry_run: bool) -> l
             if known_fixtures and fixture_id not in known_fixtures:
                 report.skip("матч отсутствует в базе")
                 continue
-            if known_teams and team_id not in known_teams:
-                report.skip("команда отсутствует в базе")
-                continue
+            teams[team_id] = to_text(row.get("team")) or f"Команда {team_id}"
             if (fixture_id, team_id) in seen:
                 report.skip("повтор пары матч-команда в файле")
                 continue
@@ -604,7 +619,7 @@ def import_statistics(conn, source: Path, limit: int | None, dry_run: bool) -> l
             break
 
     flush()
-    return [report]
+    return [teams_report, report]
 
 
 def fill_fetch_state(conn, dry_run: bool) -> Report:
