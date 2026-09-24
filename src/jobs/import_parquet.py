@@ -28,10 +28,20 @@ from typing import Any, Iterable, Iterator
 
 import psycopg
 
+from src.common.convert import (
+    is_missing as _is_missing,
+    to_date,
+    to_decimal,
+    to_int,
+    to_percent,
+    to_text,
+    to_utc,
+)
+from src.common.db import BATCH_SIZE as _SHARED_BATCH_SIZE, write_batch
 from src.common.keys import event_key
 from src.db.connection import connect
 
-BATCH_SIZE = 5_000
+BATCH_SIZE = _SHARED_BATCH_SIZE
 
 DATASETS = ("leagues", "fixtures", "events", "statistics")
 
@@ -100,70 +110,6 @@ class Report:
 # ------------------------------------------------------- преобразование типов
 
 
-def _is_missing(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    text = str(value).strip().lower()
-    return text in {"", "nan", "none", "<na>", "nat"}
-
-
-def to_int(value: Any) -> int | None:
-    if _is_missing(value):
-        return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def to_percent(value: Any) -> int | None:
-    """`"58%"` -> 58. Нечисловое значение даёт пустое поле (ПР-6)."""
-    if _is_missing(value):
-        return None
-    try:
-        return int(float(str(value).strip().rstrip("%")))
-    except (TypeError, ValueError):
-        return None
-
-
-def to_decimal(value: Any) -> float | None:
-    if _is_missing(value):
-        return None
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def to_utc(value: Any) -> datetime | None:
-    """ISO-строка со смещением -> время в UTC (ФТ-2)."""
-    if _is_missing(value):
-        return None
-    text = str(value).strip().replace("Z", "+00:00")
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
-
-
-def to_date(value: Any):
-    if _is_missing(value):
-        return None
-    try:
-        return datetime.fromisoformat(str(value)[:10]).date()
-    except ValueError:
-        return None
-
-
-def to_text(value: Any) -> str | None:
-    return None if _is_missing(value) else str(value).strip()
-
-
 # ----------------------------------------------------------- чтение и запись
 
 
@@ -178,35 +124,7 @@ def read_batches(path: Path, columns: list[str] | None = None) -> Iterator[list[
         yield batch.to_pylist()
 
 
-def write_batch(
-    conn: psycopg.Connection,
-    table: str,
-    columns: Iterable[str],
-    rows: list[tuple],
-    conflict_key: str,
-    update_columns: Iterable[str] | None = None,
-) -> int:
-    """Пишет пакет одной транзакцией с ON CONFLICT DO UPDATE (ПР-8)."""
-    if not rows:
-        return 0
-    cols = list(columns)
-    placeholders = ", ".join(["%s"] * len(cols))
-    updates = list(update_columns) if update_columns is not None else cols
-    updates = [c for c in updates if c not in conflict_key.split(", ")]
-    if updates:
-        action = "DO UPDATE SET " + ", ".join(
-            f"{c} = EXCLUDED.{c}" for c in updates
-        )
-    else:
-        action = "DO NOTHING"
-    sql = (
-        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
-        f"ON CONFLICT ({conflict_key}) {action}"
-    )
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.executemany(sql, rows)
-    return len(rows)
+# write_batch — теперь в src/common/db.py (используется и сбором).
 
 
 # --------------------------------------------------------------- сопоставление

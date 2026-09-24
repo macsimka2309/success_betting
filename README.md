@@ -35,9 +35,22 @@ cp .env.example .env    # и указать DATABASE_URL и APIFOOTBALL_KEY
 Схема меняется только миграциями. Файлы — `migrations/NNN_описание.sql`,
 откат — `migrations/NNN_описание.down.sql`.
 
+## Ежедневный сбор
+
+```bash
+export APIFOOTBALL_KEY=...
+python3 -m src.jobs.collect --job catalog     # раз в неделю
+python3 -m src.jobs.collect --job odds        # дважды в сутки, 00:00 и 12:00 UTC
+python3 -m src.jobs.collect --job daily       # матчи, травмы, коэффициенты, события, статистика, составы
+```
+
+Отдельные шаги (`fixtures`, `injuries`, `events`, `statistics`, `lineups`) —
+для ручного запуска и разбора проблем. `--max-requests` ограничивает бюджет
+разового запуска, `--cache-dir` задаёт каталог сырых ответов API.
+
 ## Тесты
 
-Тесты клиента API-Football обращений к сети не делают (подменённый
+Тесты клиента API-Football и сбора обращений к сети не делают (подменённый
 транспорт). Тесты миграций и переноса нужна отдельная база, production не
 затрагивается:
 
