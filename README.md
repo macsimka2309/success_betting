@@ -37,12 +37,16 @@ cp .env.example .env    # и указать DATABASE_URL и APIFOOTBALL_KEY
 
 ## Тесты
 
-Нужна отдельная база, production не затрагивается:
+Тесты клиента API-Football обращений к сети не делают (подменённый
+транспорт). Тесты миграций и переноса нужна отдельная база, production не
+затрагивается:
 
 ```bash
 createdb football_test
 TEST_DATABASE_URL="postgresql:///football_test" .venv/bin/python -m pytest tests -q
 ```
+
+Без `TEST_DATABASE_URL` тесты, зависящие от базы, пропускаются, а не падают.
 
 ## Доступ к серверной базе
 
