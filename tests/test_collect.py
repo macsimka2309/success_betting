@@ -661,3 +661,17 @@ def test_cleanup_job_removes_only_old_cache_files(tmp_path, monkeypatch):
     assert code == 0
     assert not old.exists()
     assert fresh.exists()
+
+
+def test_daily_does_not_run_odds(tmp_path, conn):
+    """Коэффициенты — отдельный запуск дважды в сутки; в ежедневный сбор не входят."""
+    seed_league_and_fixture(conn, status="FT")
+    client = make_client(tmp_path, [{"response": []}] * 20)
+
+    collect.run_daily(client, conn)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT job_name FROM collection_runs ORDER BY run_id")
+        job_names = [row[0] for row in cur.fetchall()]
+    assert job_names == ["fixtures", "injuries", "events", "statistics", "lineups"]
+    assert "odds" not in job_names

@@ -9,7 +9,7 @@
 
 Использование:
     python3 -m src.jobs.collect --job catalog
-    python3 -m src.jobs.collect --job daily   # шаги 2-7 подряд
+    python3 -m src.jobs.collect --job daily   # матчи, травмы, события, статистика, составы
     python3 -m src.jobs.collect --job odds [--odds-horizon-days N]
 """
 
@@ -674,8 +674,14 @@ def run_lineups(client: ApiClient, conn, limit: int = 20_000) -> StepContext:
 
 
 def run_daily(client: ApiClient, conn) -> list[StepContext]:
-    """Шаги 2-7 подряд, один клиент — общий бюджет (docs/02)."""
-    steps = [run_fixtures, run_injuries, run_odds, run_events, run_statistics, run_lineups]
+    """Ежедневный сбор: матчи, травмы, события, статистика, составы.
+
+    Коэффициенты (шаг 4) сюда НЕ входят: они идут отдельным запуском дважды
+    в сутки, 00:00 и 12:00 UTC (ФТ-2, ФТ-10). Будь они здесь, ежедневный
+    сбор делал бы третий снимок линии в неурочное время.
+    Один клиент — общий бюджет запросов на все шаги.
+    """
+    steps = [run_fixtures, run_injuries, run_events, run_statistics, run_lineups]
     results = []
     for step in steps:
         results.append(step(client, conn))
