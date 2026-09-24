@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -80,7 +80,7 @@ def conn():
 def seed_league_and_fixture(conn, fixture_id=1001, league_id=39, season=2025, status="NS"):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO leagues (league_id, name) VALUES (%s, 'Premier League')",
+            "INSERT INTO leagues (league_id, name, is_tracked) VALUES (%s, 'Premier League', true)",
             (league_id,),
         )
         cur.execute(
@@ -158,7 +158,7 @@ def fixture_response_item(status="FT", elapsed=90):
 
 def test_fixtures_writes_match_with_all_fields(tmp_path, conn):
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO leagues (league_id, name) VALUES (39, 'Premier League')")
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (39, 'Premier League', true)")
         cur.execute("INSERT INTO league_seasons (league_id, season) VALUES (39, 2025)")
     client = make_client(tmp_path, [{"response": [fixture_response_item()]}])
 
@@ -175,7 +175,7 @@ def test_fixtures_writes_match_with_all_fields(tmp_path, conn):
 
 def test_fixtures_update_does_not_duplicate(tmp_path, conn):
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO leagues (league_id, name) VALUES (39, 'Premier League')")
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (39, 'Premier League', true)")
         cur.execute("INSERT INTO league_seasons (league_id, season) VALUES (39, 2025)")
     client = make_client(
         tmp_path,
@@ -198,6 +198,93 @@ def test_fixtures_update_does_not_duplicate(tmp_path, conn):
         cur.execute("SELECT count(*), status_short FROM fixtures GROUP BY status_short")
         assert cur.fetchone() == (1, "FT")
     assert client2.requests_used == 1  # реально сходил в API, не взял из кэша
+
+
+# ------------------------------------------------- охват лиг и активные сезоны
+
+
+def _add_league_season(conn, league_id, season, start, end, tracked=True):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO leagues (league_id, name, is_tracked) VALUES (%s, %s, %s)",
+            (league_id, f"League {league_id}", tracked),
+        )
+        cur.execute(
+            "INSERT INTO league_seasons (league_id, season, start_date, end_date) VALUES (%s, %s, %s, %s)",
+            (league_id, season, start, end),
+        )
+
+
+def test_untracked_league_is_not_requested(tmp_path, conn):
+    """Лига вне охвата (ФТ-9) не тратит запросы, даже если сезон идёт."""
+    _add_league_season(conn, 900, 2026, "2026-08-01", "2027-05-30", tracked=False)
+    client = make_client(tmp_path, [])  # транспорт не должен вызваться
+
+    collect.run_fixtures(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert client.requests_used == 0
+
+
+def test_finished_season_is_not_requested(tmp_path, conn):
+    """Сезон, закончившийся давно, не запрашивается каждый день (ФТ-5)."""
+    _add_league_season(conn, 901, 2025, "2025-08-01", "2026-05-30")
+    client = make_client(tmp_path, [])
+
+    collect.run_fixtures(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert client.requests_used == 0
+
+
+def test_running_season_is_requested(tmp_path, conn):
+    _add_league_season(conn, 902, 2026, "2026-08-01", "2027-05-30")
+    client = make_client(tmp_path, [{"response": []}])
+
+    collect.run_fixtures(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert client.requests_used == 1
+
+
+def test_season_just_finished_is_still_requested(tmp_path, conn):
+    """Ещё неделю после конца сезона: возможны поздние правки результатов."""
+    _add_league_season(conn, 903, 2026, "2026-01-01", "2026-09-20")
+    client = make_client(tmp_path, [{"response": []}])
+
+    collect.run_fixtures(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert client.requests_used == 1
+
+
+def test_season_without_dates_is_requested(tmp_path, conn):
+    """Каталог ещё не загружен: лучше лишний запрос, чем пропущенные матчи."""
+    _add_league_season(conn, 904, 2026, None, None)
+    client = make_client(tmp_path, [{"response": []}])
+
+    collect.run_fixtures(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert client.requests_used == 1
+
+
+def test_injuries_only_where_covered_and_active(tmp_path, conn):
+    _add_league_season(conn, 905, 2026, "2026-08-01", "2027-05-30")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE league_seasons SET has_injuries = false WHERE league_id = 905")
+    client = make_client(tmp_path, [])
+
+    collect.run_injuries(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert client.requests_used == 0
+
+
+def test_events_not_requested_for_untracked_league(tmp_path, conn):
+    seed_league_and_fixture(conn, status="FT")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE leagues SET is_tracked = false")
+    client = make_client(tmp_path, [])
+
+    ctx = collect.run_events(client, conn)
+
+    assert ctx.items_processed == 0
+    assert client.requests_used == 0
 
 
 # ------------------------------------------------------------------- события

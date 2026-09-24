@@ -119,6 +119,12 @@ def run_down(conn: psycopg.Connection, version: str) -> None:
     if version not in done:
         print(f"миграция {version} не применена, откатывать нечего")
         return
+    later = sorted(v for v in done if v > version)
+    if later:
+        raise RuntimeError(
+            f"Нельзя откатить {version}: применены более поздние миграции "
+            f"({', '.join(later)}). Откатывайте в обратном порядке, начиная с {later[-1]}."
+        )
     target = next((m for m in discover() if m.version == version), None)
     if target is None:
         raise FileNotFoundError(f"Миграция {version} не найдена в {MIGRATIONS_DIR}")

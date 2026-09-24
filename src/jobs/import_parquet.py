@@ -168,6 +168,7 @@ def import_leagues(conn, source: Path, limit: int | None, dry_run: bool) -> list
                     to_text(row.get("country")),
                     to_text(row.get("cc")),
                     legacy_by_id.get(league_id),
+                    league_id in legacy_by_id,  # is_tracked: наши 782 лиги (ФТ-9)
                 )
             )
             if limit and len(rows) >= limit:
@@ -180,7 +181,7 @@ def import_leagues(conn, source: Path, limit: int | None, dry_run: bool) -> list
             catalog_report.written += write_batch(
                 conn,
                 "leagues",
-                ["league_id", "name", "type", "country", "country_code", "legacy_code"],
+                ["league_id", "name", "type", "country", "country_code", "legacy_code", "is_tracked"],
                 rows[start : start + BATCH_SIZE],
                 "league_id",
             )

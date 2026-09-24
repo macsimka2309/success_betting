@@ -233,6 +233,21 @@ def test_import_writes_expected_rows(conn, source):
     assert count(conn, "fixture_statistics") == 2
 
 
+def test_mapped_leagues_are_marked_tracked(conn, source):
+    """Наши лиги (есть прежний код) входят в охват сбора, остальные — нет (ФТ-9)."""
+    write_parquet(
+        source / "leagues_catalog.parquet",
+        [
+            {"id": 39, "name": "Premier League", "type": "League", "country": "England", "cc": "GB"},
+            {"id": 999, "name": "Cup Not Ours", "type": "Cup", "country": "World", "cc": None},
+        ],
+    )
+    imp.import_leagues(conn, source, None, False)
+    with conn.cursor() as cur:
+        cur.execute("SELECT league_id, is_tracked FROM leagues ORDER BY league_id")
+        assert cur.fetchall() == [(39, True), (999, False)]
+
+
 def test_import_is_idempotent(conn, source):
     run_all(conn, source)
     before = {t: count(conn, t) for t in ("fixtures", "fixture_events", "teams")}

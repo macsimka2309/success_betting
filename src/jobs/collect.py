@@ -36,6 +36,12 @@ from src.db.connection import connect, database_url
 # (ADR-2), повторный разбор не требует новых запросов.
 DEFAULT_BOOKMAKERS = {"1xBet", "Pinnacle"}
 
+# Сезон считается активным за 30 дней до старта и ещё 7 дней после конца:
+# расписание и результаты завершённого сезона больше не меняются, и запрашивать
+# их каждый день — трата суточного лимита впустую (ФТ-5).
+ACTIVE_BEFORE_DAYS = 30
+ACTIVE_AFTER_DAYS = 7
+
 FINISHED_STATUSES = ("FT", "AET", "PEN")
 MAX_ATTEMPTS = 3
 
@@ -149,6 +155,7 @@ def _pending_fixtures(conn, field_name: str, coverage_column: str, limit: int) -
     sql = f"""
         SELECT f.fixture_id
         FROM fixtures f
+        JOIN leagues l ON l.league_id = f.league_id AND l.is_tracked
         LEFT JOIN league_seasons ls ON ls.league_id = f.league_id AND ls.season = f.season
         LEFT JOIN fixture_fetch_state s ON s.fixture_id = f.fixture_id
         WHERE f.status_short = ANY(%s)
@@ -259,12 +266,30 @@ def run_catalog(client: ApiClient, conn) -> StepContext:
 # ------------------------------------------------------------- шаг 2: матчи
 
 
-def _target_league_seasons(conn, min_season: int) -> list[tuple[int, int]]:
+def _target_league_seasons(
+    conn, min_season: int, require_column: str | None = None, today: date | None = None
+) -> list[tuple[int, int]]:
+    """Пары лига-сезон для запроса: только отслеживаемые лиги и активные сезоны.
+
+    Сезон без дат (каталог ещё не загружен) считается активным: безопаснее
+    лишний запрос, чем пропущенные матчи. `require_column` добавляет условие
+    покрытия, например has_injuries.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    coverage = f"AND COALESCE(ls.{require_column}, true)" if require_column else ""
+    sql = f"""
+        SELECT ls.league_id, ls.season
+        FROM league_seasons ls
+        JOIN leagues l ON l.league_id = ls.league_id
+        WHERE l.is_tracked
+          AND ls.season >= %s
+          AND (ls.start_date IS NULL OR ls.end_date IS NULL
+               OR (ls.start_date - %s::int <= %s::date AND %s::date <= ls.end_date + %s::int))
+          {coverage}
+        ORDER BY ls.league_id, ls.season
+    """
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT league_id, season FROM league_seasons WHERE season >= %s ORDER BY league_id, season",
-            (min_season,),
-        )
+        cur.execute(sql, (min_season, ACTIVE_BEFORE_DAYS, today, today, ACTIVE_AFTER_DAYS))
         return [(row[0], row[1]) for row in cur.fetchall()]
 
 
@@ -324,12 +349,14 @@ def _parse_fixture_item(item: dict, requested_league: int, requested_season: int
     }
 
 
-def run_fixtures(client: ApiClient, conn, min_season: int | None = None) -> StepContext:
-    """Матчи по всем действующим лигам-сезонам (ФТ-2, ФТ-5, ЕС-4)."""
+def run_fixtures(
+    client: ApiClient, conn, min_season: int | None = None, today: date | None = None
+) -> StepContext:
+    """Матчи по отслеживаемым лигам в активных сезонах (ФТ-2, ФТ-5, ФТ-9)."""
     if min_season is None:
         min_season = datetime.now(timezone.utc).year - 1
     with collection_run(conn, client, "fixtures") as ctx:
-        for league_id, season in _target_league_seasons(conn, min_season):
+        for league_id, season in _target_league_seasons(conn, min_season, today=today):
             if client.quota_exhausted or client.requests_used >= client.max_requests:
                 break
             # Кэш не используется: статус и счёт матча меняются день ото дня
@@ -361,17 +388,13 @@ def run_fixtures(client: ApiClient, conn, min_season: int | None = None) -> Step
 # ------------------------------------------------------------- шаг 3: травмы
 
 
-def run_injuries(client: ApiClient, conn, min_season: int | None = None) -> StepContext:
-    """Травмы, только для лиг-сезонов с has_injuries (ФТ-5)."""
+def run_injuries(
+    client: ApiClient, conn, min_season: int | None = None, today: date | None = None
+) -> StepContext:
+    """Травмы: отслеживаемые лиги, активные сезоны, покрытие has_injuries (ФТ-5)."""
     if min_season is None:
         min_season = datetime.now(timezone.utc).year - 1
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT league_id, season FROM league_seasons "
-            "WHERE season >= %s AND COALESCE(has_injuries, true) ORDER BY league_id, season",
-            (min_season,),
-        )
-        pairs = [(row[0], row[1]) for row in cur.fetchall()]
+    pairs = _target_league_seasons(conn, min_season, require_column="has_injuries", today=today)
 
     with collection_run(conn, client, "injuries") as ctx:
         for league_id, season in pairs:
