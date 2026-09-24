@@ -388,6 +388,14 @@ def run_fixtures(
 # ------------------------------------------------------------- шаг 3: травмы
 
 
+def _existing_fixture_ids(conn, ids: set[int]) -> set[int]:
+    if not ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("SELECT fixture_id FROM fixtures WHERE fixture_id = ANY(%s)", (list(ids),))
+        return {row[0] for row in cur.fetchall()}
+
+
 def run_injuries(
     client: ApiClient, conn, min_season: int | None = None, today: date | None = None
 ) -> StepContext:
@@ -407,7 +415,14 @@ def run_injuries(
             )
             if body is None or body.get("errors"):
                 continue
-            for item in body.get("response") or []:
+            items = body.get("response") or []
+            # Травма может сослаться на матч, которого ещё нет в базе (например,
+            # бюджет шага «матчи» кончился раньше): внешний ключ уронил бы весь
+            # шаг. Такие строки пропускаются и подхватятся на следующий день.
+            known = _existing_fixture_ids(
+                conn, {to_int((i.get("fixture") or {}).get("id")) for i in items} - {None}
+            )
+            for item in items:
                 fixture_id = to_int((item.get("fixture") or {}).get("id"))
                 player = item.get("player") or {}
                 team = item.get("team") or {}
@@ -415,6 +430,9 @@ def run_injuries(
                 player_id = to_int(player.get("id"))
                 team_id = to_int(team.get("id"))
                 if fixture_id is None or player_id is None or team_id is None:
+                    ctx.skipped += 1
+                    continue
+                if fixture_id not in known:
                     ctx.skipped += 1
                     continue
                 _upsert_player(conn, player_id, player.get("name"))
@@ -686,11 +704,17 @@ def main(argv: list[str] | None = None) -> int:
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Ежедневный сбор данных API-Football")
-    parser.add_argument("--job", required=True, choices=sorted(JOBS))
+    parser.add_argument("--job", required=True, choices=sorted(JOBS) + ["cleanup"])
     parser.add_argument("--max-requests", type=int, default=7_000)
     parser.add_argument("--odds-horizon-days", type=int, default=3)
     parser.add_argument("--cache-dir", type=Path, default=Path("cache"))
     args = parser.parse_args(argv)
+
+    if args.job == "cleanup":
+        # Только удаление старых файлов кэша (ADR-2): ни ключ, ни база не нужны.
+        removed = ApiClient(key="", cache_dir=args.cache_dir, verbose=False).cleanup_cache(30)
+        print(f"удалено файлов кэша старше 30 дней: {removed}")
+        return 0
 
     key = os.environ.get("APIFOOTBALL_KEY")
     if not key:

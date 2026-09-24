@@ -1,0 +1,23 @@
+# Расписание сбора football-collector. Устанавливается в /etc/cron.d/football-collector.
+#
+# ВРЕМЯ — МОСКОВСКОЕ (MSK = UTC+3, без перехода на летнее время). Сервер работает
+# в Europe/Moscow, а cron 3.0pl1 из Ubuntu 24.04 не поддерживает CRON_TZ, поэтому
+# расписание из UTC пересчитано вручную. Обёртка run_collect.sh отказывается
+# запускаться, если пояс сервера изменился (docs/04, пункт 1а).
+#
+#   UTC      MSK      шаг
+#   00:00    03:00    коэффициенты, снимок 1
+#   03:00    06:00    очистка кэша старше 30 дней
+#   05:00    08:00    каталог лиг (по понедельникам)
+#   06:00    09:00    ежедневный сбор: матчи, травмы, события, статистика, составы
+#   12:00    15:00    коэффициенты, снимок 2
+#
+# Бюджеты запросов заданы явно: у каждого процесса свой счётчик, поэтому сумма
+# по суткам — не больше 6 500 + 2 x 300 + 50 = 7 150 при лимите тарифа 7 500.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 3,15 * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh odds 300
+0 6    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh cleanup
+0 8    * * 1  deploy  /opt/apps/football-collector/deploy/run_collect.sh catalog 50
+0 9    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh daily 6500

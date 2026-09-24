@@ -275,6 +275,40 @@ def test_injuries_only_where_covered_and_active(tmp_path, conn):
     assert client.requests_used == 0
 
 
+def test_injury_for_unknown_fixture_is_skipped_not_fatal(tmp_path, conn):
+    """Травма на матч, которого нет в базе, не должна ронять весь шаг."""
+    _add_league_season(conn, 906, 2026, "2026-08-01", "2027-05-30")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE league_seasons SET has_injuries = true WHERE league_id = 906")
+        cur.execute("INSERT INTO teams (team_id, name) VALUES (36, 'Fulham'), (34, 'Newcastle')")
+        cur.execute(
+            """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
+               status_short, home_team_id, away_team_id)
+               VALUES (5001, 906, 2026, now(), current_date, 'NS', 36, 34)"""
+        )
+
+    def entry(fixture_id, player_id):
+        return {
+            "player": {"id": player_id, "name": f"P{player_id}", "type": "Missing Fixture", "reason": "Knee"},
+            "team": {"id": 36, "name": "Fulham"},
+            "fixture": {"id": fixture_id},
+            "league": {"id": 906, "season": 2026},
+        }
+
+    body = {"response": [entry(5001, 11), entry(9999, 12)]}  # 9999 в базе нет
+    client = make_client(tmp_path, [body])
+
+    ctx = collect.run_injuries(client, conn, min_season=2025, today=date(2026, 9, 24))
+
+    assert ctx.items_processed == 1
+    assert ctx.skipped == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT fixture_id, player_id FROM injuries")
+        assert cur.fetchall() == [(5001, 11)]
+        cur.execute("SELECT status FROM collection_runs WHERE job_name = 'injuries'")
+        assert cur.fetchone()[0] != "failed"
+
+
 def test_events_not_requested_for_untracked_league(tmp_path, conn):
     seed_league_and_fixture(conn, status="FT")
     with conn.cursor() as cur:
@@ -606,3 +640,24 @@ def test_daily_stops_remaining_steps_when_quota_exhausted(tmp_path, conn):
         job_names = [row[0] for row in cur.fetchall()]
     # первый же шаг (fixtures) исчерпал суточный лимит API -> дальше не идём
     assert job_names == ["fixtures"]
+
+
+def test_cleanup_job_removes_only_old_cache_files(tmp_path, monkeypatch):
+    """`--job cleanup` работает без ключа и базы и трогает только старые файлы."""
+    import os
+    import time
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    old, fresh = cache / "old.json", cache / "fresh.json"
+    old.write_text("{}")
+    fresh.write_text("{}")
+    long_ago = time.time() - 31 * 86400
+    os.utime(old, (long_ago, long_ago))
+    monkeypatch.delenv("APIFOOTBALL_KEY", raising=False)
+
+    code = collect.main(["--job", "cleanup", "--cache-dir", str(cache)])
+
+    assert code == 0
+    assert not old.exists()
+    assert fresh.exists()
