@@ -673,5 +673,6 @@ def test_daily_does_not_run_odds(tmp_path, conn):
     with conn.cursor() as cur:
         cur.execute("SELECT job_name FROM collection_runs ORDER BY run_id")
         job_names = [row[0] for row in cur.fetchall()]
-    assert job_names == ["fixtures", "injuries", "events", "statistics", "lineups"]
+    # дозагрузка идёт последней и на остатке (ДЗ-2)
+    assert job_names == ["fixtures", "injuries", "events", "statistics", "lineups", "backfill"]
     assert "odds" not in job_names

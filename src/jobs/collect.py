@@ -45,6 +45,15 @@ ACTIVE_AFTER_DAYS = 7
 FINISHED_STATUSES = ("FT", "AET", "PEN")
 MAX_ATTEMPTS = 3
 
+# Свежие матчи — последние FRESH_DAYS дней: их события, статистику и составы
+# ежедневный сбор берёт с приоритетом. Всё старше — дозагрузка на остатке
+# лимита (specs/дозагрузка-пропущенного.md, ДЗ-1, ДЗ-3).
+FRESH_DAYS = 3
+# Горизонт дозагрузки: день, с которого прервался сбор (docs/00).
+DEFAULT_BACKFILL_SINCE = date(2026, 7, 8)
+# Дозагрузка идёт раундами: по столько матчей на каждый набор за раунд (ДЗ-4).
+BACKFILL_CHUNK = 50
+
 # API -> наши колонки статистики (проверено на живом ответе 24.09.2026).
 STAT_TYPE_MAP = {
     "Shots on Goal": "shots_on_goal",
@@ -148,10 +157,30 @@ def mark_fetched(conn, fixture_id: int, field_name: str) -> None:
         )
 
 
-def _pending_fixtures(conn, field_name: str, coverage_column: str, limit: int) -> list[int]:
-    """Матчи, где данных ещё нет, а источник их отдаёт (ЕС-4, ЕС-5)."""
+def _pending_fixtures(
+    conn,
+    field_name: str,
+    coverage_column: str,
+    limit: int,
+    min_date: date | None = None,
+    max_date: date | None = None,
+) -> list[int]:
+    """Матчи, где данных ещё нет, а источник их отдаёт (ЕС-4, ЕС-5).
+
+    `min_date` (включительно) и `max_date` (не включая) ограничивают дату матча:
+    так ежедневный сбор берёт свежие, а дозагрузка — более старые.
+    """
     fetched_column = _FETCHED_COLUMN[field_name]
     attempt_column = _ATTEMPT_COLUMN[field_name]
+    params: list = [list(FINISHED_STATUSES), MAX_ATTEMPTS]
+    date_filter = ""
+    if min_date is not None:
+        date_filter += " AND f.match_date >= %s"
+        params.append(min_date)
+    if max_date is not None:
+        date_filter += " AND f.match_date < %s"
+        params.append(max_date)
+    params.append(limit)
     sql = f"""
         SELECT f.fixture_id
         FROM fixtures f
@@ -162,12 +191,12 @@ def _pending_fixtures(conn, field_name: str, coverage_column: str, limit: int) -
           AND COALESCE(ls.{coverage_column}, true)
           AND (s.fixture_id IS NULL OR (
                 s.{fetched_column} IS NULL AND COALESCE(s.{attempt_column}, 0) < %s
-          ))
+          )){date_filter}
         ORDER BY f.match_date DESC, f.fixture_id
         LIMIT %s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (list(FINISHED_STATUSES), MAX_ATTEMPTS, limit))
+        cur.execute(sql, params)
         return [row[0] for row in cur.fetchall()]
 
 
@@ -537,47 +566,44 @@ def run_odds(client: ApiClient, conn, horizon_days: int = 3, bookmakers: set[str
 # ---------------------------------------------------- шаги 5-7: события/статистика/составы
 
 
-def run_events(client: ApiClient, conn, limit: int = 20_000) -> StepContext:
-    with collection_run(conn, client, "events") as ctx:
-        fixture_ids = _pending_fixtures(conn, "events", "has_events", limit)
-        for fixture_id in fixture_ids:
-            try:
-                items = _fetch_items(client, "/fixtures/events", fixture_id)
-            except Stop:
-                break
-            if items is None:
-                mark_attempt(conn, fixture_id, "events")
-                continue
-            for event in items:
-                team = event.get("team") or {}
-                player = event.get("player") or {}
-                assist = event.get("assist") or {}
-                time_info = event.get("time") or {}
-                team_id = to_int(team.get("id"))
-                player_id = to_int(player.get("id"))
-                _upsert_team(conn, team_id, team.get("name"))
-                _upsert_player(conn, player_id, player.get("name"))
-                assist_id = to_int(assist.get("id"))
-                if assist_id is not None:
-                    _upsert_player(conn, assist_id, assist.get("name"))
-                key = event_key(
-                    fixture_id, time_info.get("elapsed"), time_info.get("extra"),
-                    team_id, event.get("type"), event.get("detail"), player_id,
-                )
-                write_row(
-                    conn, "fixture_events",
-                    ["fixture_id", "team_id", "minute", "minute_extra", "type", "detail",
-                     "player_id", "assist_player_id", "comments", "event_key"],
-                    (
-                        fixture_id, team_id, to_int(time_info.get("elapsed")), to_int(time_info.get("extra")),
-                        to_text(event.get("type")) or "unknown", to_text(event.get("detail")),
-                        player_id, assist_id, to_text(event.get("comments")), key,
-                    ),
-                    "event_key",
-                )
-            mark_fetched(conn, fixture_id, "events")
-            ctx.items_processed += 1
-    return ctx
+def _process_events(client: ApiClient, conn, fixture_id: int) -> bool:
+    """События одного матча. True — записаны, False — неудача (попытка учтена).
+
+    Бросает Stop, когда бюджет клиента исчерпан (до каких-либо записей).
+    """
+    items = _fetch_items(client, "/fixtures/events", fixture_id)
+    if items is None:
+        mark_attempt(conn, fixture_id, "events")
+        return False
+    for event in items:
+        team = event.get("team") or {}
+        player = event.get("player") or {}
+        assist = event.get("assist") or {}
+        time_info = event.get("time") or {}
+        team_id = to_int(team.get("id"))
+        player_id = to_int(player.get("id"))
+        _upsert_team(conn, team_id, team.get("name"))
+        _upsert_player(conn, player_id, player.get("name"))
+        assist_id = to_int(assist.get("id"))
+        if assist_id is not None:
+            _upsert_player(conn, assist_id, assist.get("name"))
+        key = event_key(
+            fixture_id, time_info.get("elapsed"), time_info.get("extra"),
+            team_id, event.get("type"), event.get("detail"), player_id,
+        )
+        write_row(
+            conn, "fixture_events",
+            ["fixture_id", "team_id", "minute", "minute_extra", "type", "detail",
+             "player_id", "assist_player_id", "comments", "event_key"],
+            (
+                fixture_id, team_id, to_int(time_info.get("elapsed")), to_int(time_info.get("extra")),
+                to_text(event.get("type")) or "unknown", to_text(event.get("detail")),
+                player_id, assist_id, to_text(event.get("comments")), key,
+            ),
+            "event_key",
+        )
+    mark_fetched(conn, fixture_id, "events")
+    return True
 
 
 def _parse_statistics_row(entry: dict) -> dict[str, int | float | None]:
@@ -599,92 +625,251 @@ STAT_COLUMNS = (
 )
 
 
-def run_statistics(client: ApiClient, conn, limit: int = 20_000) -> StepContext:
-    with collection_run(conn, client, "statistics") as ctx:
-        fixture_ids = _pending_fixtures(conn, "statistics", "has_statistics", limit)
-        for fixture_id in fixture_ids:
+def _process_statistics(client: ApiClient, conn, fixture_id: int) -> bool:
+    items = _fetch_items(client, "/fixtures/statistics", fixture_id)
+    if items is None:
+        mark_attempt(conn, fixture_id, "statistics")
+        return False
+    for entry in items:
+        team = entry.get("team") or {}
+        team_id = to_int(team.get("id"))
+        if team_id is None:
+            continue
+        _upsert_team(conn, team_id, team.get("name"))
+        values = _parse_statistics_row(entry)
+        write_row(
+            conn, "fixture_statistics",
+            ["fixture_id", "team_id", *STAT_COLUMNS],
+            (fixture_id, team_id, *[values.get(c) for c in STAT_COLUMNS]),
+            "fixture_id, team_id",
+        )
+    mark_fetched(conn, fixture_id, "statistics")
+    return True
+
+
+def _process_lineups(client: ApiClient, conn, fixture_id: int) -> bool:
+    items = _fetch_items(client, "/fixtures/lineups", fixture_id)
+    if items is None:
+        mark_attempt(conn, fixture_id, "lineups")
+        return False
+    for entry in items:
+        team = entry.get("team") or {}
+        coach = entry.get("coach") or {}
+        team_id = to_int(team.get("id"))
+        if team_id is None:
+            continue
+        _upsert_team(conn, team_id, team.get("name"))
+        write_row(
+            conn, "fixture_lineups",
+            ["fixture_id", "team_id", "formation", "coach_id", "coach_name"],
+            (fixture_id, team_id, to_text(entry.get("formation")), to_int(coach.get("id")), to_text(coach.get("name"))),
+            "fixture_id, team_id",
+        )
+        for is_starter, group in ((True, entry.get("startXI")), (False, entry.get("substitutes"))):
+            for slot in group or []:
+                player = slot.get("player") or {}
+                player_id = to_int(player.get("id"))
+                if player_id is None:
+                    continue
+                _upsert_player(conn, player_id, player.get("name"))
+                write_row(
+                    conn, "fixture_lineup_players",
+                    ["fixture_id", "team_id", "player_id", "is_starter", "shirt_number", "position", "grid"],
+                    (fixture_id, team_id, player_id, is_starter, to_int(player.get("number")), to_text(player.get("pos")), to_text(player.get("grid"))),
+                    "fixture_id, team_id, player_id",
+                )
+    mark_fetched(conn, fixture_id, "lineups")
+    return True
+
+
+KINDS = ("events", "statistics", "lineups")
+_PROCESSORS = {"events": _process_events, "statistics": _process_statistics, "lineups": _process_lineups}
+_COVERAGE = {"events": "has_events", "statistics": "has_statistics", "lineups": "has_lineups"}
+
+
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _budget_left(client: ApiClient) -> bool:
+    return not client.quota_exhausted and client.requests_used < client.max_requests
+
+
+def _run_fresh(
+    client: ApiClient, conn, kind: str, limit: int, fresh_days: int | None, today: date | None
+) -> StepContext:
+    """Шаги 5-7: только свежие матчи (ДЗ-1). `fresh_days=None` — без ограничения по дате."""
+    min_date = None
+    if fresh_days is not None:
+        min_date = (today or _today()) - timedelta(days=fresh_days)
+    with collection_run(conn, client, kind) as ctx:
+        for fixture_id in _pending_fixtures(conn, kind, _COVERAGE[kind], limit, min_date=min_date):
             try:
-                items = _fetch_items(client, "/fixtures/statistics", fixture_id)
+                if _PROCESSORS[kind](client, conn, fixture_id):
+                    ctx.items_processed += 1
             except Stop:
                 break
-            if items is None:
-                mark_attempt(conn, fixture_id, "statistics")
-                continue
-            for entry in items:
-                team = entry.get("team") or {}
-                team_id = to_int(team.get("id"))
-                if team_id is None:
-                    continue
-                _upsert_team(conn, team_id, team.get("name"))
-                values = _parse_statistics_row(entry)
-                write_row(
-                    conn, "fixture_statistics",
-                    ["fixture_id", "team_id", *STAT_COLUMNS],
-                    (fixture_id, team_id, *[values.get(c) for c in STAT_COLUMNS]),
-                    "fixture_id, team_id",
-                )
-            mark_fetched(conn, fixture_id, "statistics")
-            ctx.items_processed += 1
     return ctx
 
 
-def run_lineups(client: ApiClient, conn, limit: int = 20_000) -> StepContext:
-    with collection_run(conn, client, "lineups") as ctx:
-        fixture_ids = _pending_fixtures(conn, "lineups", "has_lineups", limit)
-        for fixture_id in fixture_ids:
-            try:
-                items = _fetch_items(client, "/fixtures/lineups", fixture_id)
-            except Stop:
-                break
-            if items is None:
-                mark_attempt(conn, fixture_id, "lineups")
-                continue
-            for entry in items:
-                team = entry.get("team") or {}
-                coach = entry.get("coach") or {}
-                team_id = to_int(team.get("id"))
-                if team_id is None:
-                    continue
-                _upsert_team(conn, team_id, team.get("name"))
-                write_row(
-                    conn, "fixture_lineups",
-                    ["fixture_id", "team_id", "formation", "coach_id", "coach_name"],
-                    (fixture_id, team_id, to_text(entry.get("formation")), to_int(coach.get("id")), to_text(coach.get("name"))),
-                    "fixture_id, team_id",
+def run_events(client: ApiClient, conn, limit: int = 20_000, fresh_days: int | None = FRESH_DAYS, today: date | None = None) -> StepContext:
+    return _run_fresh(client, conn, "events", limit, fresh_days, today)
+
+
+def run_statistics(client: ApiClient, conn, limit: int = 20_000, fresh_days: int | None = FRESH_DAYS, today: date | None = None) -> StepContext:
+    return _run_fresh(client, conn, "statistics", limit, fresh_days, today)
+
+
+def run_lineups(client: ApiClient, conn, limit: int = 20_000, fresh_days: int | None = FRESH_DAYS, today: date | None = None) -> StepContext:
+    return _run_fresh(client, conn, "lineups", limit, fresh_days, today)
+
+
+# ------------------------------------------------------------ шаг 8: дозагрузка
+
+
+def run_backfill(
+    client: ApiClient,
+    conn,
+    since: date = DEFAULT_BACKFILL_SINCE,
+    fresh_days: int = FRESH_DAYS,
+    today: date | None = None,
+    chunk: int = BACKFILL_CHUNK,
+) -> StepContext:
+    """Дозагрузка пропущенного на остатке лимита (ФТ-11, specs/дозагрузка-пропущенного.md).
+
+    Берёт матчи от `since` (включительно) до границы свежих (не включая): свежие
+    обрабатывает ежедневный сбор. Остаток бюджета делится между событиями,
+    статистикой и составами раундами по `chunk` матчей на набор (ДЗ-4); у набора
+    с пустой очередью долю забирают остальные. Внутри набора — от новых к старым.
+    """
+    upper = (today or _today()) - timedelta(days=fresh_days)
+    done = dict.fromkeys(KINDS, 0)
+    with collection_run(conn, client, "backfill") as ctx:
+        active = list(KINDS)
+        while active and _budget_left(client):
+            for kind in list(active):
+                ids = _pending_fixtures(
+                    conn, kind, _COVERAGE[kind], chunk, min_date=since, max_date=upper
                 )
-                for is_starter, group in ((True, entry.get("startXI")), (False, entry.get("substitutes"))):
-                    for slot in group or []:
-                        player = slot.get("player") or {}
-                        player_id = to_int(player.get("id"))
-                        if player_id is None:
-                            continue
-                        _upsert_player(conn, player_id, player.get("name"))
-                        write_row(
-                            conn, "fixture_lineup_players",
-                            ["fixture_id", "team_id", "player_id", "is_starter", "shirt_number", "position", "grid"],
-                            (fixture_id, team_id, player_id, is_starter, to_int(player.get("number")), to_text(player.get("pos")), to_text(player.get("grid"))),
-                            "fixture_id, team_id, player_id",
-                        )
-            mark_fetched(conn, fixture_id, "lineups")
-            ctx.items_processed += 1
+                if not ids:
+                    active.remove(kind)
+                    continue
+                try:
+                    for fixture_id in ids:
+                        if _PROCESSORS[kind](client, conn, fixture_id):
+                            done[kind] += 1
+                            ctx.items_processed += 1
+                except Stop:
+                    active.clear()  # бюджет кончился — остановка целиком (ДЗ-10)
+                    break
+    print(
+        f"дозагрузка: события {done['events']}, статистика {done['statistics']}, "
+        f"составы {done['lineups']}"
+    )
     return ctx
+
+
+def backfill_report(
+    conn,
+    since: date = DEFAULT_BACKFILL_SINCE,
+    fresh_days: int = FRESH_DAYS,
+    today: date | None = None,
+    avg_leftover: int = 5_500,
+) -> dict:
+    """Очередь по трём наборам: свежие / дозагрузка / глубокая история (ДЗ-9).
+
+    Только читает базу. `avg_leftover` — средний остаток лимита в сутки для
+    оценки срока. Возвращает словарь, чтобы отчёт можно было проверить тестом.
+    """
+    upper = (today or _today()) - timedelta(days=fresh_days)
+    sql = """
+        WITH pend AS (
+            SELECT f.match_date,
+                   (s.events_fetched_at IS NULL AND COALESCE(s.events_attempts, 0) < %(max)s
+                        AND COALESCE(ls.has_events, true)) AS need_events,
+                   (s.statistics_fetched_at IS NULL AND COALESCE(s.statistics_attempts, 0) < %(max)s
+                        AND COALESCE(ls.has_statistics, true)) AS need_statistics,
+                   (s.lineups_fetched_at IS NULL AND COALESCE(s.lineups_attempts, 0) < %(max)s
+                        AND COALESCE(ls.has_lineups, true)) AS need_lineups
+            FROM fixtures f
+            JOIN leagues l ON l.league_id = f.league_id AND l.is_tracked
+            LEFT JOIN league_seasons ls ON ls.league_id = f.league_id AND ls.season = f.season
+            LEFT JOIN fixture_fetch_state s ON s.fixture_id = f.fixture_id
+            WHERE f.status_short = ANY(%(finished)s)
+        )
+        SELECT CASE WHEN match_date >= %(upper)s THEN 'fresh'
+                    WHEN match_date >= %(since)s THEN 'backfill'
+                    ELSE 'deep' END AS grp,
+               count(*) FILTER (WHERE need_events),
+               count(*) FILTER (WHERE need_statistics),
+               count(*) FILTER (WHERE need_lineups)
+        FROM pend GROUP BY 1
+    """
+    params = {"max": MAX_ATTEMPTS, "finished": list(FINISHED_STATUSES), "upper": upper, "since": since}
+    report = {g: dict.fromkeys(KINDS, 0) for g in ("fresh", "backfill", "deep")}
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        for grp, events, statistics, lineups in cur.fetchall():
+            report[grp] = {"events": events, "statistics": statistics, "lineups": lineups}
+    remaining = sum(report["backfill"].values())
+    report["backfill_requests"] = remaining
+    report["eta_days"] = -(-remaining // avg_leftover) if remaining else 0  # округление вверх
+    return report
+
+
+def print_backfill_report(conn, since: date, fresh_days: int, avg_leftover: int = 5_500) -> dict:
+    report = backfill_report(conn, since, fresh_days, avg_leftover=avg_leftover)
+    print(f"Очередь сбора (горизонт дозагрузки с {since}, свежие — последние {fresh_days} дн.)\n")
+    print(f"{'группа':<28}{'события':>10}{'статистика':>12}{'составы':>10}")
+    titles = {
+        "fresh": "свежие (ежедневный сбор)",
+        "backfill": "дозагрузка",
+        "deep": f"глубокая история (до {since})",
+    }
+    for grp in ("fresh", "backfill", "deep"):
+        r = report[grp]
+        print(f"{titles[grp]:<28}{r['events']:>10}{r['statistics']:>12}{r['lineups']:>10}")
+    print(
+        f"\nДозагрузка: {report['backfill_requests']} запросов, "
+        f"около {report['eta_days']} сут. при среднем остатке {avg_leftover} в сутки."
+    )
+    return report
 
 
 # ---------------------------------------------------------------------- daily
 
 
-def run_daily(client: ApiClient, conn) -> list[StepContext]:
-    """Ежедневный сбор: матчи, травмы, события, статистика, составы.
+def run_daily(
+    client: ApiClient,
+    conn,
+    fresh_days: int = FRESH_DAYS,
+    backfill: bool = True,
+    backfill_since: date = DEFAULT_BACKFILL_SINCE,
+    today: date | None = None,
+) -> list[StepContext]:
+    """Ежедневный сбор: матчи, травмы, свежие события/статистика/составы, дозагрузка.
 
-    Коэффициенты (шаг 4) сюда НЕ входят: они идут отдельным запуском дважды
-    в сутки, 00:00 и 12:00 UTC (ФТ-2, ФТ-10). Будь они здесь, ежедневный
-    сбор делал бы третий снимок линии в неурочное время.
-    Один клиент — общий бюджет запросов на все шаги.
+    Порядок продиктован приоритетом (ДЗ-2): дозагрузка идёт последней и получает
+    только то, что осталось от бюджета. Коэффициенты сюда НЕ входят: они идут
+    отдельным запуском дважды в сутки (ФТ-2, ФТ-10), иначе ежедневный сбор делал бы
+    третий снимок линии. Один клиент — общий бюджет запросов на все шаги.
     """
-    steps = [run_fixtures, run_injuries, run_events, run_statistics, run_lineups]
+    steps = [
+        lambda: run_fixtures(client, conn),
+        lambda: run_injuries(client, conn),
+        lambda: run_events(client, conn, fresh_days=fresh_days, today=today),
+        lambda: run_statistics(client, conn, fresh_days=fresh_days, today=today),
+        lambda: run_lineups(client, conn, fresh_days=fresh_days, today=today),
+    ]
+    if backfill:
+        steps.append(
+            lambda: run_backfill(
+                client, conn, since=backfill_since, fresh_days=fresh_days, today=today
+            )
+        )
     results = []
     for step in steps:
-        results.append(step(client, conn))
+        results.append(step())
         if client.quota_exhausted:
             break
     return results
@@ -698,10 +883,19 @@ JOBS = {
     "fixtures": lambda client, conn, args: run_fixtures(client, conn),
     "injuries": lambda client, conn, args: run_injuries(client, conn),
     "odds": lambda client, conn, args: run_odds(client, conn, horizon_days=args.odds_horizon_days),
-    "events": lambda client, conn, args: run_events(client, conn),
-    "statistics": lambda client, conn, args: run_statistics(client, conn),
-    "lineups": lambda client, conn, args: run_lineups(client, conn),
-    "daily": lambda client, conn, args: run_daily(client, conn),
+    "events": lambda client, conn, args: run_events(client, conn, fresh_days=args.fresh_days),
+    "statistics": lambda client, conn, args: run_statistics(client, conn, fresh_days=args.fresh_days),
+    "lineups": lambda client, conn, args: run_lineups(client, conn, fresh_days=args.fresh_days),
+    "backfill": lambda client, conn, args: run_backfill(
+        client, conn, since=args.backfill_since, fresh_days=args.fresh_days
+    ),
+    "daily": lambda client, conn, args: run_daily(
+        client,
+        conn,
+        fresh_days=args.fresh_days,
+        backfill=not args.no_backfill,
+        backfill_since=args.backfill_since,
+    ),
 }
 
 
@@ -710,9 +904,13 @@ def main(argv: list[str] | None = None) -> int:
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Ежедневный сбор данных API-Football")
-    parser.add_argument("--job", required=True, choices=sorted(JOBS) + ["cleanup"])
+    parser.add_argument("--job", required=True, choices=sorted(JOBS) + ["cleanup", "backfill-report"])
     parser.add_argument("--max-requests", type=int, default=7_000)
     parser.add_argument("--odds-horizon-days", type=int, default=3)
+    parser.add_argument("--fresh-days", type=int, default=FRESH_DAYS)
+    parser.add_argument("--backfill-since", type=date.fromisoformat, default=DEFAULT_BACKFILL_SINCE)
+    parser.add_argument("--no-backfill", action="store_true", help="daily без дозагрузки")
+    parser.add_argument("--avg-leftover", type=int, default=5_500, help="для оценки срока в отчёте")
     parser.add_argument("--cache-dir", type=Path, default=Path("cache"))
     args = parser.parse_args(argv)
 
@@ -720,6 +918,12 @@ def main(argv: list[str] | None = None) -> int:
         # Только удаление старых файлов кэша (ADR-2): ни ключ, ни база не нужны.
         removed = ApiClient(key="", cache_dir=args.cache_dir, verbose=False).cleanup_cache(30)
         print(f"удалено файлов кэша старше 30 дней: {removed}")
+        return 0
+
+    if args.job == "backfill-report":
+        # Только чтение базы: ключ API и запросы не нужны (ДЗ-9).
+        with connect(database_url()) as conn:
+            print_backfill_report(conn, args.backfill_since, args.fresh_days, args.avg_leftover)
         return 0
 
     key = os.environ.get("APIFOOTBALL_KEY")
