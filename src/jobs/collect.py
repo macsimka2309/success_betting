@@ -817,6 +817,67 @@ def backfill_report(
     return report
 
 
+def completeness_report(conn, top_n: int = 20) -> list[dict]:
+    """Полнота данных по лигам (ФТ-7): доля завершённых матчей без событий,
+    статистики или составов, отдельно по каждой отслеживаемой лиге.
+
+    Только читает базу. Лиги без покрытия исходника (`has_* = false`)
+    не считаются неполными по этому набору — это ожидаемый пробел, не потеря.
+    Возвращает `top_n` лиг с наибольшей долей пропусков, по убыванию.
+    """
+    sql = """
+        SELECT l.league_id, l.name,
+               count(*) AS finished,
+               count(*) FILTER (
+                   WHERE COALESCE(ls.has_events, true) AND s.events_fetched_at IS NULL
+               ) AS missing_events,
+               count(*) FILTER (
+                   WHERE COALESCE(ls.has_statistics, true) AND s.statistics_fetched_at IS NULL
+               ) AS missing_statistics,
+               count(*) FILTER (
+                   WHERE COALESCE(ls.has_lineups, true) AND s.lineups_fetched_at IS NULL
+               ) AS missing_lineups
+        FROM fixtures f
+        JOIN leagues l ON l.league_id = f.league_id AND l.is_tracked
+        LEFT JOIN league_seasons ls ON ls.league_id = f.league_id AND ls.season = f.season
+        LEFT JOIN fixture_fetch_state s ON s.fixture_id = f.fixture_id
+        WHERE f.status_short = ANY(%(finished)s)
+        GROUP BY l.league_id, l.name
+        HAVING count(*) FILTER (
+                   WHERE (COALESCE(ls.has_events, true) AND s.events_fetched_at IS NULL)
+                      OR (COALESCE(ls.has_statistics, true) AND s.statistics_fetched_at IS NULL)
+                      OR (COALESCE(ls.has_lineups, true) AND s.lineups_fetched_at IS NULL)
+               ) > 0
+        ORDER BY count(*) FILTER (
+                   WHERE (COALESCE(ls.has_events, true) AND s.events_fetched_at IS NULL)
+                      OR (COALESCE(ls.has_statistics, true) AND s.statistics_fetched_at IS NULL)
+                      OR (COALESCE(ls.has_lineups, true) AND s.lineups_fetched_at IS NULL)
+               ) DESC
+        LIMIT %(top_n)s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"finished": list(FINISHED_STATUSES), "top_n": top_n})
+        columns = ["league_id", "name", "finished", "missing_events", "missing_statistics", "missing_lineups"]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def print_completeness_report(conn, top_n: int = 20) -> list[dict]:
+    rows = completeness_report(conn, top_n)
+    print(f"Полнота данных по лигам (топ {top_n} по числу пропусков)\n")
+    if not rows:
+        print("Пропусков нет: у каждой отслеживаемой лиги все завершённые матчи "
+              "покрыты по всем наборам, где это заявлено источником.")
+        return rows
+    print(f"{'лига':<28}{'матчей':>8}{'без событий':>13}{'без статистики':>16}{'без составов':>14}")
+    for r in rows:
+        name = r["name"][:27]
+        print(
+            f"{name:<28}{r['finished']:>8}{r['missing_events']:>13}"
+            f"{r['missing_statistics']:>16}{r['missing_lineups']:>14}"
+        )
+    return rows
+
+
 def print_backfill_report(conn, since: date, fresh_days: int, avg_leftover: int = 5_500) -> dict:
     report = backfill_report(conn, since, fresh_days, avg_leftover=avg_leftover)
     print(f"Очередь сбора (горизонт дозагрузки с {since}, свежие — последние {fresh_days} дн.)\n")
@@ -904,7 +965,7 @@ def main(argv: list[str] | None = None) -> int:
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Ежедневный сбор данных API-Football")
-    parser.add_argument("--job", required=True, choices=sorted(JOBS) + ["cleanup", "backfill-report"])
+    parser.add_argument("--job", required=True, choices=sorted(JOBS) + ["cleanup", "backfill-report", "completeness-report"])
     parser.add_argument("--max-requests", type=int, default=7_000)
     parser.add_argument("--odds-horizon-days", type=int, default=3)
     parser.add_argument("--fresh-days", type=int, default=FRESH_DAYS)
@@ -924,6 +985,12 @@ def main(argv: list[str] | None = None) -> int:
         # Только чтение базы: ключ API и запросы не нужны (ДЗ-9).
         with connect(database_url()) as conn:
             print_backfill_report(conn, args.backfill_since, args.fresh_days, args.avg_leftover)
+        return 0
+
+    if args.job == "completeness-report":
+        # Только чтение базы (ФТ-7).
+        with connect(database_url()) as conn:
+            print_completeness_report(conn)
         return 0
 
     key = os.environ.get("APIFOOTBALL_KEY")

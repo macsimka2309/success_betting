@@ -332,3 +332,64 @@ def test_report_cli_needs_no_api_key(conn, monkeypatch, capsys):
     assert code == 0
     out = capsys.readouterr().out
     assert "дозагрузка" in out and "глубокая история" in out
+
+
+# ------------------------------------------------------ отчёт по лигам (ФТ-7)
+
+
+def test_completeness_report_lists_only_leagues_with_gaps(conn):
+    seed(conn, [(1, date(2026, 9, 10)), (2, date(2026, 9, 11))])
+    with conn.cursor() as cur:
+        # матч 1 полностью собран, матч 2 — нет
+        cur.execute(
+            "INSERT INTO fixture_fetch_state (fixture_id, events_fetched_at, "
+            "statistics_fetched_at, lineups_fetched_at) VALUES (1, now(), now(), now())"
+        )
+
+    rows = collect.completeness_report(conn)
+
+    assert len(rows) == 1
+    assert rows[0]["league_id"] == 39
+    assert rows[0]["finished"] == 2
+    assert rows[0]["missing_events"] == 1
+    assert rows[0]["missing_statistics"] == 1
+    assert rows[0]["missing_lineups"] == 1
+
+
+def test_completeness_report_ignores_uncovered_sets(conn):
+    """Лига без покрытия статистики (has_statistics=false) — это не пропуск."""
+    seed(conn, [(1, date(2026, 9, 10))], coverage=(True, False, True))
+
+    rows = collect.completeness_report(conn)
+
+    assert len(rows) == 1
+    assert rows[0]["missing_statistics"] == 0  # источник и не должен её отдавать
+    assert rows[0]["missing_events"] == 1
+
+
+def test_completeness_report_empty_when_fully_collected(conn):
+    seed(conn, [(1, date(2026, 9, 10))])
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fixture_fetch_state (fixture_id, events_fetched_at, "
+            "statistics_fetched_at, lineups_fetched_at) VALUES (1, now(), now(), now())"
+        )
+
+    assert collect.completeness_report(conn) == []
+
+
+def test_completeness_report_ignores_untracked_league(conn):
+    seed(conn, [(1, date(2026, 9, 10))], tracked=False)
+
+    assert collect.completeness_report(conn) == []
+
+
+def test_completeness_report_cli_needs_no_api_key(conn, monkeypatch, capsys):
+    seed(conn, [(1, date(2026, 9, 10))])
+    monkeypatch.setenv("DATABASE_URL", TEST_URL)
+    monkeypatch.delenv("APIFOOTBALL_KEY", raising=False)
+
+    code = collect.main(["--job", "completeness-report"])
+
+    assert code == 0
+    assert "без событий" in capsys.readouterr().out
