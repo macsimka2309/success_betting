@@ -358,6 +358,36 @@ def test_build_full_rebuild_is_idempotent(conn):
     assert before == after
 
 
+def test_write_features_writes_in_kickoff_order_regardless_of_input_order(conn):
+    """Обрыв соединения на середине записи не должен оставлять «дырки» по
+    датам из-за внутренней пересортировки build() по лиге/сезону (найдено
+    на проде 30.09.2026: упавший SSH-туннель посреди записи)."""
+    _seed_season(conn, n_matches=5)
+    df = bf.build(conn)
+    shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)  # имитация "не по датам"
+
+    written_order = []
+    real_executemany = None
+    import psycopg as _psycopg
+
+    original = _psycopg.Cursor.executemany
+
+    def spy(self, sql, params_seq):
+        params_seq = list(params_seq)
+        written_order.extend(row[0] for row in params_seq)  # fixture_id — первая колонка
+        return original(self, sql, params_seq)
+
+    _psycopg.Cursor.executemany = spy
+    try:
+        bf.write_features(conn, shuffled, incremental=False)
+    finally:
+        _psycopg.Cursor.executemany = original
+
+    kickoff_by_fixture = dict(zip(df["fixture_id"], df["kickoff_at"]))
+    dates_written = [kickoff_by_fixture[fid] for fid in written_order]
+    assert dates_written == sorted(dates_written)
+
+
 def test_incremental_writes_only_new_matches(conn):
     _seed_season(conn, n_matches=20)
     df = bf.build(conn)

@@ -78,6 +78,12 @@ def conn():
 
 
 def seed_league_and_fixture(conn, fixture_id=1001, league_id=39, season=2025, status="NS"):
+    # Дата берётся из Python (datetime.now(timezone.utc)), а не из SQL
+    # current_date/now(): та зависит от часового пояса сессии Postgres, а
+    # локальная тестовая база сидит в Europe/Moscow — рассинхронизация
+    # с UTC-логикой collect.py проявлялась только в окне 21:00-00:00 UTC
+    # (найдено 30.09.2026, тест падал именно в этом окне).
+    now_utc = datetime.now(timezone.utc)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO leagues (league_id, name, is_tracked) VALUES (%s, 'Premier League', true)",
@@ -92,8 +98,8 @@ def seed_league_and_fixture(conn, fixture_id=1001, league_id=39, season=2025, st
         cur.execute(
             """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
                status_short, home_team_id, away_team_id)
-               VALUES (%s, %s, %s, now(), current_date, %s, 36, 34)""",
-            (fixture_id, league_id, season, status),
+               VALUES (%s, %s, %s, %s, %s, %s, 36, 34)""",
+            (fixture_id, league_id, season, now_utc, now_utc.date(), status),
         )
 
 

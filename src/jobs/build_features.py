@@ -177,30 +177,50 @@ def _shifted_rolling(
 ):
     """Среднее по прошлым матчам этой группы, без утечки текущего (ДП-1).
 
+    Тонкая обёртка над `_shifted_rolling_batch` для одной колонки — используется
+    там, где батчить нечего (ДП-2, ДП-7). Для ДП-3/ДП-4, где на одну и ту же
+    группу считаются 8-11 метрик сразу, нужен именно batch-вариант: иначе
+    каждая метрика пересортировывает и перегруппировывает те же самые строки
+    заново — на реальном объёме (найдено на сервере 30.09.2026, ~1,1 млн
+    матчей) это ощутимо и по времени, и по памяти.
+    """
+    frame = series.to_frame("value")
+    means, counted = _shifted_rolling_batch(frame, ["value"], groups, window, order_key, min_periods)
+    return means["value"], counted
+
+
+def _shifted_rolling_batch(
+    df: pd.DataFrame,
+    value_cols: list[str],
+    groups: pd.Series,
+    window: int | None,
+    order_key: pd.Series,
+    min_periods: int = 1,
+):
+    """Как `_shifted_rolling`, но для нескольких колонок сразу за один проход.
+
     `shift`/`rolling` внутри `groupby` опираются на порядок строк, а не на
     какой-либо ключ сортировки — поэтому функция сортирует по `order_key`
-    сама, независимо от того, в каком порядке пришли строки после `merge`
-    у вызывающего кода, и возвращает результат, выровненный по меткам
-    исходного индекса `series` (`reindex`, не позиционно) — иначе сортировка
-    внутри функции незаметно рассинхронила бы результат с остальными
-    колонками у вызывающего.
+    сама, один раз для всех переданных колонок, и возвращает результат,
+    выровненный по меткам исходного индекса `df` (`reindex`, не позиционно).
 
     `window=None` — накопительно (`expanding`), иначе — последние `window`.
-    Возвращает (среднее, число_учтённых_матчей), оба выровнены по `series.index`.
+    Возвращает (DataFrame средних по каждой колонке, Series числа учтённых
+    матчей — одна на все колонки: у них общая группа наблюдений).
     """
-    order = order_key.loc[series.index].sort_values().index
-    s = series.loc[order]
+    order = order_key.loc[df.index].sort_values().index
+    sub = df.loc[order, value_cols]
     g = groups.loc[order]
 
-    shifted = s.groupby(g).shift(1)
+    shifted = sub.groupby(g)[value_cols].shift(1)
     grouped = shifted.groupby(g)
     if window is None:
-        rolled = grouped.transform(lambda x: x.expanding(min_periods=min_periods).mean())
-        counted = grouped.transform(lambda x: x.expanding(min_periods=0).count())
+        means = grouped.transform(lambda x: x.expanding(min_periods=min_periods).mean())
+        counted = grouped[value_cols[0]].transform(lambda x: x.expanding(min_periods=0).count())
     else:
-        rolled = grouped.transform(lambda x: x.rolling(window, min_periods=min_periods).mean())
-        counted = grouped.transform(lambda x: x.rolling(window, min_periods=0).count())
-    return rolled.reindex(series.index), counted.reindex(series.index)
+        means = grouped.transform(lambda x: x.rolling(window, min_periods=min_periods).mean())
+        counted = grouped[value_cols[0]].transform(lambda x: x.rolling(window, min_periods=0).count())
+    return means.reindex(df.index), counted.reindex(df.index)
 
 
 def compute_league_lines(fx: pd.DataFrame) -> pd.DataFrame:
@@ -208,16 +228,20 @@ def compute_league_lines(fx: pd.DataFrame) -> pd.DataFrame:
     fx = fx.sort_values(["league_id", "season", "kickoff_at", "fixture_id"]).copy()
     key = fx["league_id"].astype(str) + "|" + fx["season"].astype(str)
 
-    line_mean, line_count = _shifted_rolling(fx["total_goals"], key, window=None, order_key=fx["kickoff_at"])
-    fx["league_total_line"] = half_line(line_mean).where(line_count >= MIN_LEAGUE_MATCHES)
-    fx["league_total_over"] = (fx["total_goals"] > fx["league_total_line"]).where(
-        fx["league_total_line"].notna()
+    work = fx.assign(
+        _is_home_win=(fx["result_1x2"] == "H").astype(float),
+        _is_draw=(fx["result_1x2"] == "D").astype(float),
+        _is_away_win=(fx["result_1x2"] == "A").astype(float),
     )
+    cols = ["total_goals", "_is_home_win", "_is_draw", "_is_away_win"]
+    means, count = _shifted_rolling_batch(work, cols, key, window=None, order_key=fx["kickoff_at"])
 
-    for outcome, col in (("H", "league_home_win_rate"), ("D", "league_draw_rate"), ("A", "league_away_win_rate")):
-        indicator = (fx["result_1x2"] == outcome).astype(float)
-        rate, count = _shifted_rolling(indicator, key, window=None, order_key=fx["kickoff_at"])
-        fx[col] = rate.where(count >= MIN_LEAGUE_MATCHES)
+    enough = count >= MIN_LEAGUE_MATCHES
+    fx["league_total_line"] = half_line(means["total_goals"]).where(enough)
+    fx["league_total_over"] = (fx["total_goals"] > fx["league_total_line"]).where(fx["league_total_line"].notna())
+    fx["league_home_win_rate"] = means["_is_home_win"].where(enough)
+    fx["league_draw_rate"] = means["_is_draw"].where(enough)
+    fx["league_away_win_rate"] = means["_is_away_win"].where(enough)
     return fx
 
 
@@ -234,6 +258,7 @@ def _team_long_format(fx: pd.DataFrame) -> pd.DataFrame:
             "season": fx["season"],
             "kickoff_at": fx["kickoff_at"],
             "team_id": fx["home_team_id"],
+            "opponent_id": fx["away_team_id"],
             "is_home": True,
             "goals_for": fx["reg_home"],
             "goals_against": fx["reg_away"],
@@ -247,6 +272,7 @@ def _team_long_format(fx: pd.DataFrame) -> pd.DataFrame:
             "season": fx["season"],
             "kickoff_at": fx["kickoff_at"],
             "team_id": fx["away_team_id"],
+            "opponent_id": fx["home_team_id"],
             "is_home": False,
             "goals_for": fx["reg_away"],
             "goals_against": fx["reg_home"],
@@ -306,54 +332,64 @@ def compute_team_lines(fx: pd.DataFrame, long_df: pd.DataFrame) -> pd.DataFrame:
     return fx
 
 
+_FORM_METRIC_SOURCE_COLUMNS = {
+    "goals_scored_avg": "goals_for",
+    "goals_conceded_avg": "goals_against",
+    "points_avg": "points",
+    "win_rate": "win",
+    "draw_rate": "draw",
+    "loss_rate": "loss",
+    "clean_sheet_rate": "clean_sheet",
+    "failed_to_score_rate": "failed_to_score",
+}
+
+
 def compute_form(long_df: pd.DataFrame) -> pd.DataFrame:
-    """ДП-3: форма, окна SHORT/LONG, в рамках сезона, без MIN_WINDOW-отсечения."""
+    """ДП-3: форма, окна SHORT/LONG, в рамках сезона, без MIN_WINDOW-отсечения.
+
+    Все метрики группы (scope, window) считаются одним проходом
+    `_shifted_rolling_batch`, а не по отдельному вызову на каждую — иначе
+    на реальном объёме (~1,1 млн матчей) 3 scope × 2 window × 9 метрик =
+    54 отдельные пересортировки одних и тех же строк съедали память и время
+    несоразмерно (найдено на сервере 30.09.2026, пришлось прерывать прогон).
+    """
     out = pd.DataFrame({"fixture_id": long_df["fixture_id"], "team_id": long_df["team_id"], "is_home": long_df["is_home"]})
 
-    scopes = {
-        "overall": long_df.index,
-        "home": long_df.index[long_df["is_home"]],
-        "away": long_df.index[~long_df["is_home"]],
-    }
-    metrics = {
-        "goals_scored_avg": long_df["goals_for"],
-        "goals_conceded_avg": long_df["goals_against"],
-        "points_avg": long_df["points"],
-        "win_rate": long_df["win"].astype(float),
-        "draw_rate": long_df["draw"].astype(float),
-        "loss_rate": long_df["loss"].astype(float),
-        "clean_sheet_rate": long_df["clean_sheet"].astype(float),
-        "failed_to_score_rate": long_df["failed_to_score"].astype(float),
-    }
+    work = long_df.copy()
+    for source_col in ("win", "draw", "loss", "clean_sheet", "failed_to_score"):
+        work[source_col] = work[source_col].astype(float)
+    source_cols = list(_FORM_METRIC_SOURCE_COLUMNS.values())
 
+    scopes = {
+        "overall": work.index,
+        "home": work.index[work["is_home"]],
+        "away": work.index[~work["is_home"]],
+    }
     for scope, idx in scopes.items():
-        sub_key = long_df.loc[idx, "team_season_key"]
+        sub_key = work.loc[idx, "team_season_key"]
+        order_key = work.loc[idx, "kickoff_at"]
         for window_name, window in (("short", SHORT_WINDOW), ("long", LONG_WINDOW)):
-            order_key = long_df.loc[idx, "kickoff_at"]
-            _, counted = _shifted_rolling(
-                long_df.loc[idx, "goals_for"], sub_key, window=window, order_key=order_key
-            )
+            means, counted = _shifted_rolling_batch(work.loc[idx], source_cols, sub_key, window, order_key)
             out.loc[idx, f"form__{scope}__{window_name}__matches_played"] = counted.values
-            for metric, series in metrics.items():
-                mean, _ = _shifted_rolling(series.loc[idx], sub_key, window=window, order_key=order_key)
-                out.loc[idx, f"form__{scope}__{window_name}__{metric}"] = mean.values
+            for metric, source_col in _FORM_METRIC_SOURCE_COLUMNS.items():
+                out.loc[idx, f"form__{scope}__{window_name}__{metric}"] = means[source_col].values
     return out
 
 
 def compute_statistics_features(long_df: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame:
     """ДП-4: та же механика, что ДП-3, плюс coverage — доля матчей окна со статистикой.
 
-    «Соперник» для каждой строки long_df — единственная другая команда
-    в том же fixture_id (в long_df ровно две строки на матч), находится
-    явным self-join по fixture_id, без предположений об индексах/порядке.
-    """
-    fixture_teams = long_df[["fixture_id", "team_id"]]
-    opponent_map = fixture_teams.merge(fixture_teams, on="fixture_id", suffixes=("", "_opp"))
-    opponent_map = opponent_map[opponent_map["team_id"] != opponent_map["team_id_opp"]]
-    opponent_map = opponent_map.rename(columns={"team_id_opp": "opponent_id"})
+    «Соперник» берётся из уже готовой колонки `long_df.opponent_id`
+    (заполняется в `_team_long_format` напрямую из home/away_team_id той
+    же строки fixtures) — без self-join по fixture_id: на реальном объёме
+    (~1,1 млн матчей → 2,2 млн строк long_df) такой join давал 4 строки на
+    матч до фильтрации, лишний расход памяти без необходимости (найдено
+    вместе с проблемой в compute_form, 30.09.2026).
 
-    merged = long_df.merge(opponent_map, on=["fixture_id", "team_id"], how="left")
-    merged = merged.merge(stats, on=["fixture_id", "team_id"], how="left")  # свои — "for"
+    Все метрики группы (scope, window) считаются одним проходом
+    `_shifted_rolling_batch`, как в ДП-3 — по той же причине.
+    """
+    merged = long_df.merge(stats, on=["fixture_id", "team_id"], how="left")  # свои — "for"
     merged["has_stats"] = merged["shots_on_goal"].notna().astype(float)
 
     opp_stats = stats.rename(columns={m: f"{m}_against" for m in STAT_METRICS})
@@ -362,6 +398,9 @@ def compute_statistics_features(long_df: pd.DataFrame, stats: pd.DataFrame) -> p
 
     out = pd.DataFrame({"fixture_id": long_df["fixture_id"], "team_id": long_df["team_id"], "is_home": long_df["is_home"]})
 
+    source_cols = ["has_stats"] + [
+        f"{metric}{suffix}" for metric in STAT_METRICS for suffix in ("", "_against")
+    ]
     scopes = {
         "overall": merged.index,
         "home": merged.index[merged["is_home"]],
@@ -369,16 +408,13 @@ def compute_statistics_features(long_df: pd.DataFrame, stats: pd.DataFrame) -> p
     }
     for scope, idx in scopes.items():
         sub_key = merged.loc[idx, "team_season_key"]
+        order_key = merged.loc[idx, "kickoff_at"]
         for window_name, window in (("short", SHORT_WINDOW), ("long", LONG_WINDOW)):
-            order_key = merged.loc[idx, "kickoff_at"]
-            cov_mean, _ = _shifted_rolling(
-                merged.loc[idx, "has_stats"], sub_key, window=window, order_key=order_key
-            )
-            out.loc[idx, f"stats__{scope}__{window_name}__stats_coverage"] = cov_mean.values
+            means, _ = _shifted_rolling_batch(merged.loc[idx], source_cols, sub_key, window, order_key)
+            out.loc[idx, f"stats__{scope}__{window_name}__stats_coverage"] = means["has_stats"].values
             for metric in STAT_METRICS:
                 for direction, col in (("for", metric), ("against", f"{metric}_against")):
-                    mean, _ = _shifted_rolling(merged.loc[idx, col], sub_key, window=window, order_key=order_key)
-                    out.loc[idx, f"stats__{scope}__{window_name}__{metric}_{direction}_avg"] = mean.values
+                    out.loc[idx, f"stats__{scope}__{window_name}__{metric}_{direction}_avg"] = means[col].values
     return out
 
 
@@ -684,7 +720,18 @@ def _pivot_side_features(long_features: pd.DataFrame, prefix: str) -> pd.DataFra
 
 
 def write_features(conn: psycopg.Connection, df: pd.DataFrame, incremental: bool) -> int:
-    """Пишет в ml_match_features. При --incremental — только новые fixture_id."""
+    """Пишет в ml_match_features. При --incremental — только новые fixture_id.
+
+    Пишет строго по возрастанию kickoff_at — независимо от того, в каком
+    порядке `build()` собрал строки внутри (compute_league_lines
+    пересортировывает по лиге/сезону). Без этого обрыв сети на середине
+    записи (найдено на проде 30.09.2026: упавший SSH-туннель) оставлял бы
+    в базе не «всё до какой-то даты», а случайную вперемешку по лигам
+    подмножество — и последующий --incremental, ориентируясь на
+    max(kickoff_at) уже записанного, не понял бы, что часть более ранних
+    матчей из других лиг ещё не попала в базу, и молча их пропустил бы.
+    """
+    df = df.sort_values(["kickoff_at", "fixture_id"])
     columns = ["fixture_id"] + [name for name, _ in all_columns()]
     if incremental:
         with conn.cursor() as cur:
