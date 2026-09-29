@@ -83,6 +83,7 @@ def test_up_is_idempotent(conn):
 
 def test_down_then_up_again(conn):
     migrate.run_up(conn)
+    migrate.run_down(conn, "003")
     migrate.run_down(conn, "002")
     migrate.run_down(conn, "001")
     assert "fixtures" not in table_names(conn)
@@ -92,7 +93,7 @@ def test_down_then_up_again(conn):
 
 
 def test_down_refuses_when_later_migration_applied(conn):
-    """Откат 001 при применённой 002 снёс бы таблицы под её ногами."""
+    """Откат 001 при применённых более поздних миграциях снёс бы таблицы под их ногами."""
     migrate.run_up(conn)
     with pytest.raises(RuntimeError, match="более поздние"):
         migrate.run_down(conn, "001")

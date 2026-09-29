@@ -676,3 +676,65 @@ def test_daily_does_not_run_odds(tmp_path, conn):
     # дозагрузка идёт последней и на остатке (ДЗ-2)
     assert job_names == ["fixtures", "injuries", "events", "statistics", "lineups", "backfill"]
     assert "odds" not in job_names
+
+
+# ------------------------------------------------------------ ft90 (ДП-0)
+
+
+def test_fixtures_aet_stores_ft90_from_fulltime(tmp_path, conn):
+    """Матч AET: goals = счёт после доп. времени, ft90_* = счёт 90 минут."""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (39, 'PL', true)")
+        cur.execute("INSERT INTO league_seasons (league_id, season) VALUES (39, 2025)")
+    item = fixture_response_item(status="AET", elapsed=120)
+    item["goals"] = {"home": 2, "away": 2}
+    item["score"] = {"halftime": {"home": 1, "away": 0}, "fulltime": {"home": 1, "away": 2}}
+    client = make_client(tmp_path, [{"response": [item]}])
+
+    collect.run_fixtures(client, conn, min_season=2025)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT goals_home, goals_away, ft90_home, ft90_away FROM fixtures WHERE fixture_id=1001")
+        assert cur.fetchone() == (2, 2, 1, 2)
+
+
+def test_fixtures_ft_leaves_ft90_null(tmp_path, conn):
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (39, 'PL', true)")
+        cur.execute("INSERT INTO league_seasons (league_id, season) VALUES (39, 2025)")
+    client = make_client(tmp_path, [{"response": [fixture_response_item(status="FT")]}])
+
+    collect.run_fixtures(client, conn, min_season=2025)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT ft90_home, ft90_away FROM fixtures WHERE fixture_id=1001")
+        assert cur.fetchone() == (None, None)
+
+
+def test_ft90_backfill_updates_only_aet_pen_without_ft90(tmp_path, conn):
+    seed_league_and_fixture(conn, fixture_id=2001, status="AET")
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
+               status_short, home_team_id, away_team_id)
+               VALUES (2002, 39, 2025, now(), current_date, 'FT', 36, 34)"""
+        )
+    body = {
+        "response": [
+            {
+                "fixture": {"id": 2001},
+                "score": {"fulltime": {"home": 1, "away": 1}},
+            }
+        ]
+    }
+    client = make_client(tmp_path, [body])
+
+    ctx = collect.run_ft90_backfill(client, conn)
+
+    assert ctx.items_processed == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT ft90_home, ft90_away FROM fixtures WHERE fixture_id=2001")
+        assert cur.fetchone() == (1, 1)
+        cur.execute("SELECT ft90_home FROM fixtures WHERE fixture_id=2002")
+        assert cur.fetchone() == (None,)  # FT не выбирается вовсе, запрос не тратится
+    assert client.requests_used == 1

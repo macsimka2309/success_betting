@@ -327,6 +327,7 @@ FIXTURE_COLUMNS = (
     "round", "status_short", "status_long", "elapsed",
     "home_team_id", "away_team_id", "goals_home", "goals_away",
     "ht_home", "ht_away", "venue_name", "venue_city",
+    "ft90_home", "ft90_away",
 )
 
 
@@ -347,6 +348,13 @@ def _parse_fixture_item(item: dict, requested_league: int, requested_season: int
     home = teams.get("home") or {}
     away = teams.get("away") or {}
     halftime = score.get("halftime") or {}
+    # ДП-0 (specs/препроцессинг-для-модели.md): score.fulltime — счёт
+    # ОСНОВНОГО времени. Для goals_home/away API отдаёт итог с учётом
+    # дополнительного времени у AET/PEN-матчей, что путает результат
+    # 1X2, считающийся по 90 минутам. ft90_* хранит именно этот счёт;
+    # для обычных FT он и без нас совпадает с goals_home/away, поэтому
+    # ft90_* остаётся NULL — переопределять не нужно.
+    fulltime = score.get("fulltime") or {}
 
     fixture_id = to_int(fixture.get("id"))
     kickoff = to_utc(fixture.get("date"))
@@ -355,6 +363,12 @@ def _parse_fixture_item(item: dict, requested_league: int, requested_season: int
     if fixture_id is None or kickoff is None or home_id is None or away_id is None:
         return None
 
+    status_short = to_text(status.get("short"))
+    ft90_home = ft90_away = None
+    if status_short in ("AET", "PEN"):
+        ft90_home = to_int(fulltime.get("home"))
+        ft90_away = to_int(fulltime.get("away"))
+
     return {
         "fixture_id": fixture_id,
         "league_id": to_int(league.get("id")) or requested_league,
@@ -362,7 +376,7 @@ def _parse_fixture_item(item: dict, requested_league: int, requested_season: int
         "kickoff_at": kickoff,
         "match_date": kickoff.date(),
         "round": to_text(league.get("round")),
-        "status_short": to_text(status.get("short")),
+        "status_short": status_short,
         "status_long": to_text(status.get("long")),
         "elapsed": to_int(status.get("elapsed")),
         "home_team_id": home_id,
@@ -373,6 +387,8 @@ def _parse_fixture_item(item: dict, requested_league: int, requested_season: int
         "ht_away": to_int(halftime.get("away")),
         "venue_name": to_text(venue.get("name")),
         "venue_city": to_text(venue.get("city")),
+        "ft90_home": ft90_home,
+        "ft90_away": ft90_away,
         "home_team_name": to_text(home.get("name")),
         "away_team_name": to_text(away.get("name")),
     }
@@ -897,6 +913,45 @@ def print_backfill_report(conn, since: date, fresh_days: int, avg_leftover: int 
     return report
 
 
+# ------------------------------------------------ разовая дозагрузка ft90 (ДП-0)
+
+
+def run_ft90_backfill(client: ApiClient, conn, limit: int = 5_000) -> StepContext:
+    """Счёт основного времени для уже собранных AET/PEN-матчей (ДП-0).
+
+    Разовая операция: обычный сбор (`run_fixtures`) с этого момента сам
+    заполняет ft90_* для новых AET/PEN-матчей (см. _parse_fixture_item).
+    Этот шаг закрывает то, что накопилось до исправления.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT fixture_id FROM fixtures
+               WHERE status_short IN ('AET', 'PEN') AND ft90_home IS NULL
+               ORDER BY fixture_id LIMIT %s""",
+            (limit,),
+        )
+        fixture_ids = [row[0] for row in cur.fetchall()]
+
+    with collection_run(conn, client, "ft90_backfill") as ctx:
+        for fixture_id in fixture_ids:
+            if client.quota_exhausted or client.requests_used >= client.max_requests:
+                break
+            body = client.get("/fixtures", {"id": fixture_id}, use_cache=False)
+            if body is None or body.get("errors") or not body.get("response"):
+                continue
+            fulltime = (body["response"][0].get("score") or {}).get("fulltime") or {}
+            ft90_home, ft90_away = to_int(fulltime.get("home")), to_int(fulltime.get("away"))
+            if ft90_home is None or ft90_away is None:
+                continue
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE fixtures SET ft90_home = %s, ft90_away = %s WHERE fixture_id = %s",
+                    (ft90_home, ft90_away, fixture_id),
+                )
+            ctx.items_processed += 1
+    return ctx
+
+
 # ---------------------------------------------------------------------- daily
 
 
@@ -940,6 +995,7 @@ def run_daily(
 
 
 JOBS = {
+    "ft90-backfill": lambda client, conn, args: run_ft90_backfill(client, conn),
     "catalog": lambda client, conn, args: run_catalog(client, conn),
     "fixtures": lambda client, conn, args: run_fixtures(client, conn),
     "injuries": lambda client, conn, args: run_injuries(client, conn),
