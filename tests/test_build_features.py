@@ -88,6 +88,22 @@ def test_targets_ft_falls_back_to_goals_and_btts():
     assert row["dc_1x"] and not row["dc_x2"] and row["dc_12"]
 
 
+def test_finished_match_without_score_is_dropped_not_crashed(capsys):
+    """Найдено на продовых данных 29.09.2026: FT/AET/PEN без счёта — дефект
+    данных, а не что-то, что np.select должен молча проглотить или упасть на."""
+    df = make_fixtures_df(
+        [
+            {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+             "away_team_id": 20, "kickoff_at": ts(1), "goals_home": None, "goals_away": None},
+            {"fixture_id": 2, "league_id": 1, "season": 2026, "home_team_id": 10,
+             "away_team_id": 20, "kickoff_at": ts(2), "goals_home": 1, "goals_away": 0},
+        ]
+    )
+    out = bf.compute_targets(df)
+    assert list(out["fixture_id"]) == [2]
+    assert "1" in capsys.readouterr().out  # fixture_id пропущенного упомянут в выводе
+
+
 def test_draw_gives_both_double_chance_but_not_no_draw():
     df = make_fixtures_df(
         [{"fixture_id": 3, "league_id": 1, "season": 2026, "home_team_id": 10,

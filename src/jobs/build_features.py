@@ -140,6 +140,20 @@ def compute_targets(fx: pd.DataFrame) -> pd.DataFrame:
     fx["reg_home"] = fx["reg_home"].astype("Int64")
     fx["reg_away"] = fx["reg_away"].astype("Int64")
 
+    # Матч отмечен завершённым (FT/AET/PEN), но без счёта — дефект данных
+    # (найдено на продовых данных 29.09.2026: 4 таких строки). Без счёта
+    # нет цели ни по одному рынку, поэтому строка исключается целиком,
+    # а не протаскивается дальше с NA — иначе np.select ниже упал бы
+    # на нечистом булевом массиве (нашлось именно так, тестами на
+    # синтетических данных со всегда полным счётом это не поймать).
+    missing_score = fx["reg_home"].isna() | fx["reg_away"].isna()
+    if missing_score.any():
+        print(
+            f"  пропущено матчей без счёта при завершённом статусе: {int(missing_score.sum())} "
+            f"(fixture_id: {fx.loc[missing_score, 'fixture_id'].tolist()})"
+        )
+        fx = fx.loc[~missing_score].copy()
+
     conditions = [fx["reg_home"] > fx["reg_away"], fx["reg_home"] < fx["reg_away"]]
     fx["result_1x2"] = np.select(conditions, ["H", "A"], default="D")
     fx["total_goals"] = fx["reg_home"] + fx["reg_away"]
