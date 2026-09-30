@@ -847,53 +847,63 @@ def write_elo_state(conn: psycopg.Connection, fx: pd.DataFrame, ratings: dict[tu
             )
 
 
-def write_elo_state_resilient(url: str, fx: pd.DataFrame, ratings: dict[tuple[int, int], float]) -> int:
-    """Как `write_elo_state`, но переподключается на каждую пару (team, league)
-    вместо одного соединения, держащегося открытым на все пары.
+def write_elo_state_resilient(url: str, fx: pd.DataFrame, ratings: dict[tuple[int, int], float], batch_size: int = 2_000) -> int:
+    """Как `write_elo_state`, но пакетно и с переподключением на пакет.
 
-    Найдено на проде 30.09.2026: одно долгоживущее соединение на ~3300
-    последовательных мелких запросов зависло НАВСЕГДА (не упало с ошибкой,
-    а просто перестало отвечать — со стороны Postgres на сервере в этот
-    момент не было ни одного активного запроса, то есть локальная сторона
-    ждала ответа, который уже никогда не придёт). Короткие соединения на
-    пару менее уязвимы к такому зависанию, а таймаут на каждой попытке
-    гарантирует, что она не повиснет молча.
+    Первая версия делала SELECT+INSERT отдельным соединением на каждую пару
+    (team, league) — при ~26 тысячах пар и накладных расходах на установку
+    соединения через SSH-туннель это заняло бы часы (по факту на проде
+    30.09.2026 — около 1000 пар за 10 минут, то есть ~4 часа на всё).
+    Настоящая причина медленности была не в "зависании" (та версия и
+    появилась как раз из-за того, что до неё ОДНО долгоживущее соединение
+    на все пары зависло намертво без ошибки) — а в самой стратегии
+    "запрос на пару". Правильное решение — то же, что уже применено в
+    write_features_resilient: посчитать "последний fixture_id команды
+    в лиге" ОДНИМ запросом на все пары сразу, затем писать пакетами.
     """
+    if not ratings:
+        return 0
+
+    finished = fx[fx["reg_home"].notna()] if "reg_home" in fx.columns else fx
+    long_ids = pd.concat(
+        [
+            finished[["league_id", "home_team_id", "fixture_id"]].rename(columns={"home_team_id": "team_id"}),
+            finished[["league_id", "away_team_id", "fixture_id"]].rename(columns={"away_team_id": "team_id"}),
+        ],
+        ignore_index=True,
+    )
+    last_fixture = long_ids.groupby(["team_id", "league_id"])["fixture_id"].max()
+
+    rows = []
+    for (team_id, league_id), rating in ratings.items():
+        fixture_id = last_fixture.get((team_id, league_id))
+        if fixture_id is None or pd.isna(fixture_id):
+            continue
+        rows.append((team_id, league_id, rating, int(fixture_id)))
+
+    sql = (
+        "INSERT INTO ml_team_elo_state (team_id, league_id, rating, as_of_fixture_id) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (team_id, league_id) DO UPDATE "
+        "SET rating = EXCLUDED.rating, as_of_fixture_id = EXCLUDED.as_of_fixture_id, updated_at = now()"
+    )
     written = 0
-    total = len(ratings)
-    for i, ((team_id, league_id), rating) in enumerate(ratings.items(), 1):
+    total_batches = -(-len(rows) // batch_size)
+    for i, start in enumerate(range(0, len(rows), batch_size), 1):
+        chunk = rows[start : start + batch_size]
         for attempt in range(1, 4):
             try:
-                with psycopg.connect(url, connect_timeout=10) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SET statement_timeout = '15s'")
-                        cur.execute(
-                            """SELECT max(fixture_id) FROM (
-                                   SELECT fixture_id FROM fixtures WHERE league_id=%s AND home_team_id=%s
-                                   UNION ALL
-                                   SELECT fixture_id FROM fixtures WHERE league_id=%s AND away_team_id=%s
-                               ) t""",
-                            (league_id, team_id, league_id, team_id),
-                        )
-                        fixture_id = cur.fetchone()[0]
-                        if fixture_id is not None:
-                            cur.execute(
-                                """INSERT INTO ml_team_elo_state (team_id, league_id, rating, as_of_fixture_id)
-                                   VALUES (%s, %s, %s, %s)
-                                   ON CONFLICT (team_id, league_id) DO UPDATE
-                                   SET rating = EXCLUDED.rating, as_of_fixture_id = EXCLUDED.as_of_fixture_id, updated_at = now()""",
-                                (team_id, league_id, rating, fixture_id),
-                            )
-                        conn.commit()
-                written += 1
+                with connect(url) as conn, conn.cursor() as cur:
+                    with conn.transaction():
+                        cur.executemany(sql, chunk)
                 break
-            except (psycopg.OperationalError, psycopg.errors.QueryCanceled) as error:
+            except psycopg.OperationalError as error:
                 if attempt == 3:
-                    print(f"  пара {i}/{total} (team={team_id}, league={league_id}) не записана: {error}")
-                    break
+                    raise
+                print(f"  пакет Эло {i}/{total_batches}: {error}; повтор {attempt}/3")
                 time.sleep(2 * attempt)
-        if i % 500 == 0 or i == total:
-            print(f"  Эло записано: {i}/{total}")
+        written += len(chunk)
+        print(f"  Эло записано: {i}/{total_batches} ({written} пар)")
     return written
 
 

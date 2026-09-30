@@ -455,6 +455,22 @@ def test_elo_state_persisted_after_write(conn):
         assert cur.fetchone()[0] > 0
 
 
+def test_write_elo_state_resilient_matches_batch_write(conn):
+    """Пакетная версия (по факту переписанная после зависания на проде
+    30.09.2026: одиночные соединения на пару team/league оказались
+    непрактично медленными через SSH-туннель) даёт тот же результат."""
+    _seed_season(conn, n_matches=8)
+    df = bf.build(conn)
+    ratings = df.attrs["elo_final_ratings"]
+
+    written = bf.write_elo_state_resilient(TEST_URL, df, ratings, batch_size=3)
+
+    assert written == len(ratings)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ml_team_elo_state")
+        assert cur.fetchone()[0] == len(ratings)
+
+
 def test_injuries_counted_without_leaking_across_matches(conn):
     _seed_season(conn, n_matches=3)
     with conn.cursor() as cur:
