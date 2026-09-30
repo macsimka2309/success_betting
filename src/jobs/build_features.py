@@ -26,7 +26,7 @@
 Использование:
     python3 -m src.jobs.build_features                 # полный пересчёт
     python3 -m src.jobs.build_features --incremental
-    python3 -m src.jobs.build_features --upcoming [--horizon-days 7]
+    python3 -m src.jobs.build_features --upcoming [--horizon-days 2]
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ LONG_WINDOW = 5
 H2H_WINDOW = 5
 FINISHED_STATUSES = ("FT", "AET", "PEN")
 UPCOMING_STATUS = "NS"
-DEFAULT_UPCOMING_HORIZON_DAYS = 7
+DEFAULT_UPCOMING_HORIZON_DAYS = 2
 
 ELO_DEFAULT = 1500.0
 ELO_K = 20.0
