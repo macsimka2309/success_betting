@@ -13,15 +13,20 @@
 корректно, но не быстрее полного прохода. Оптимизация — на будущее,
 когда/если станет ощутимо медленно для еженедельного запуска (ДП-12).
 
-Режим `--upcoming` — инференс на ещё не сыгранные матчи (ДП-9 расширение):
-считает те же признаки для несыгранных матчей в горизонте `--horizon-days`
-от текущего момента, используя всю прошлую историю как основание для
-скользящих метрик (утечки нет — история идёт только до текущего момента,
-а сам факт будущего матча не даёт ничего вперёд), но не записывает и не
-меняет исторические строки и состояние Эло: целевые колонки (`reg_home`,
-`result_1x2`, `btts` и т.д.) у таких строк остаются NULL, потому что
-результата ещё нет. Строка перезаписывается тем же upsert'ом, когда матч
-будет сыгран и рассчитан обычным (не `--upcoming`) прогоном.
+Режим `--upcoming` (`build_upcoming`) — инференс на ещё не сыгранные матчи
+(ДП-9а): считает те же признаки для несыгранных матчей в горизонте
+`--horizon-days` от текущего момента, но в отличие от полного пересчёта
+не читает всю историю — только текущий сезон затронутых лиг, конкретные
+пары команд для личных встреч и уже посчитанное состояние Эло
+(`ml_team_elo_state`) вместо повторного прохода по всей базе. Это на два
+порядка меньше данных (см. докстринг `build_upcoming`) — безопасно по
+памяти для ежедневного cron прямо на сервере, в отличие от полного
+пересчёта (см. `docs/06`, этап 8). Утечки нет — история идёт только до
+текущего момента. Не записывает и не меняет исторические строки и
+состояние Эло: целевые колонки (`reg_home`, `result_1x2`, `btts` и т.д.)
+у таких строк остаются NULL, потому что результата ещё нет. Строка
+перезаписывается тем же upsert'ом, когда матч будет сыгран и рассчитан
+обычным (не `--upcoming`) прогоном.
 
 Использование:
     python3 -m src.jobs.build_features                 # полный пересчёт
@@ -78,30 +83,42 @@ def half_line(x: pd.Series) -> pd.Series:
 # --------------------------------------------------------------------- чтение
 
 
-def load_fixtures(
-    conn: psycopg.Connection, include_upcoming: bool = False, horizon_days: int | None = None
-) -> pd.DataFrame:
-    """Завершённые матчи (для целей и истории) плюс, при `include_upcoming`,
-    ещё не сыгранные матчи в горизонте `horizon_days` дней вперёд от текущего
-    момента (`--upcoming`, инференс) — им не хватает счёта, поэтому дальше
-    по пайплайну они остаются с NULL в целевых колонках."""
+def load_fixtures(conn: psycopg.Connection) -> pd.DataFrame:
     sql = """
         SELECT fixture_id, league_id, season, match_date, kickoff_at,
                home_team_id, away_team_id, status_short,
                goals_home, goals_away, ft90_home, ft90_away
         FROM fixtures
-        WHERE status_short = ANY(%(finished)s)
+        WHERE status_short = ANY(%s)
+        ORDER BY kickoff_at, fixture_id
     """
-    params: dict = {"finished": list(FINISHED_STATUSES)}
-    if include_upcoming:
-        sql += """
-            OR (status_short = %(upcoming_status)s
-                AND kickoff_at >= now()
-                AND kickoff_at < now() + (%(horizon_days)s || ' days')::interval)
-        """
-        params["upcoming_status"] = UPCOMING_STATUS
-        params["horizon_days"] = str(horizon_days or DEFAULT_UPCOMING_HORIZON_DAYS)
-    sql += " ORDER BY kickoff_at, fixture_id"
+    with conn.cursor() as cur:
+        cur.execute(sql, (list(FINISHED_STATUSES),))
+        cols = [d.name for d in cur.description]
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=cols)
+    df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+    return df
+
+
+def load_upcoming_fixtures(conn: psycopg.Connection, horizon_days: int | None = None) -> pd.DataFrame:
+    """Только сами ещё не сыгранные матчи (`--upcoming`) в горизонте
+    `horizon_days` дней от текущего момента, включая текущий день —
+    без истории: история грузится отдельно и точечно, см. `build_upcoming`."""
+    sql = """
+        SELECT fixture_id, league_id, season, match_date, kickoff_at,
+               home_team_id, away_team_id, status_short,
+               goals_home, goals_away, ft90_home, ft90_away
+        FROM fixtures
+        WHERE status_short = %(upcoming_status)s
+          AND kickoff_at >= now()
+          AND kickoff_at < now() + (%(horizon_days)s || ' days')::interval
+        ORDER BY kickoff_at, fixture_id
+    """
+    params = {
+        "upcoming_status": UPCOMING_STATUS,
+        "horizon_days": str(horizon_days or DEFAULT_UPCOMING_HORIZON_DAYS),
+    }
     with conn.cursor() as cur:
         cur.execute(sql, params)
         cols = [d.name for d in cur.description]
@@ -111,28 +128,115 @@ def load_fixtures(
     return df
 
 
-def load_statistics(conn: psycopg.Connection) -> pd.DataFrame:
+def load_season_history(conn: psycopg.Connection, league_seasons: list[tuple[int, int]]) -> pd.DataFrame:
+    """Завершённые матчи затронутых `(league_id, season)` — не вся история.
+
+    Линиям (ДП-2), форме (ДП-3), статистике (ДП-4) и турнирной таблице
+    (ДП-7) для конкретного будущего матча (`--upcoming`) не нужна история
+    других лиг и прошлых сезонов — все они либо считаются в рамках
+    текущего сезона данной лиги, либо (форма/статистика) всё равно не
+    заглядывают дальше последних SHORT/LONG_WINDOW матчей внутри него.
+    На проде (30.09.2026, горизонт 2 дня) это ~7 тыс. строк вместо 981 тыс.
+    """
+    empty_cols = [
+        "fixture_id", "league_id", "season", "match_date", "kickoff_at",
+        "home_team_id", "away_team_id", "status_short",
+        "goals_home", "goals_away", "ft90_home", "ft90_away",
+    ]
+    if not league_seasons:
+        df = pd.DataFrame(columns=empty_cols)
+        df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+        return df
+    league_ids = [ls[0] for ls in league_seasons]
+    seasons = [ls[1] for ls in league_seasons]
+    sql = """
+        SELECT f.fixture_id, f.league_id, f.season, f.match_date, f.kickoff_at,
+               f.home_team_id, f.away_team_id, f.status_short,
+               f.goals_home, f.goals_away, f.ft90_home, f.ft90_away
+        FROM fixtures f
+        JOIN (SELECT unnest(%(league_ids)s::int[]) AS league_id,
+                     unnest(%(seasons)s::int[]) AS season) ls
+          ON f.league_id = ls.league_id AND f.season = ls.season
+        WHERE f.status_short = ANY(%(finished)s)
+        ORDER BY f.kickoff_at, f.fixture_id
+    """
+    params = {"league_ids": league_ids, "seasons": seasons, "finished": list(FINISHED_STATUSES)}
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d.name for d in cur.description]
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=cols)
+    df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+    return df
+
+
+def load_h2h_history(conn: psycopg.Connection, pairs: list[tuple[int, int]]) -> pd.DataFrame:
+    """Завершённые матчи конкретных пар команд, сквозь все сезоны (ДП-5
+    считается не в рамках сезона) — только пары из `--upcoming` набора,
+    не все ~26 тыс. пар в базе."""
+    empty_cols = [
+        "fixture_id", "league_id", "season", "match_date", "kickoff_at",
+        "home_team_id", "away_team_id", "status_short",
+        "goals_home", "goals_away", "ft90_home", "ft90_away",
+    ]
+    if not pairs:
+        df = pd.DataFrame(columns=empty_cols)
+        df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+        return df
+    t1 = [p[0] for p in pairs]
+    t2 = [p[1] for p in pairs]
+    sql = """
+        SELECT f.fixture_id, f.league_id, f.season, f.match_date, f.kickoff_at,
+               f.home_team_id, f.away_team_id, f.status_short,
+               f.goals_home, f.goals_away, f.ft90_home, f.ft90_away
+        FROM fixtures f
+        JOIN (SELECT unnest(%(t1)s::int[]) AS t1, unnest(%(t2)s::int[]) AS t2) pairs
+          ON LEAST(f.home_team_id, f.away_team_id) = LEAST(pairs.t1, pairs.t2)
+         AND GREATEST(f.home_team_id, f.away_team_id) = GREATEST(pairs.t1, pairs.t2)
+        WHERE f.status_short = ANY(%(finished)s)
+        ORDER BY f.kickoff_at, f.fixture_id
+    """
+    params = {"t1": t1, "t2": t2, "finished": list(FINISHED_STATUSES)}
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d.name for d in cur.description]
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=cols)
+    df["kickoff_at"] = pd.to_datetime(df["kickoff_at"], utc=True)
+    return df
+
+
+def load_statistics(conn: psycopg.Connection, fixture_ids: list[int] | None = None) -> pd.DataFrame:
     sql = """
         SELECT fixture_id, team_id, shots_on_goal, total_shots, corner_kicks,
                ball_possession, expected_goals
         FROM fixture_statistics
     """
+    params = None
+    if fixture_ids is not None:
+        sql += " WHERE fixture_id = ANY(%s)"
+        params = (list(fixture_ids),)
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, params)
         cols = [d.name for d in cur.description]
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=cols)
 
 
-def load_injuries(conn: psycopg.Connection) -> pd.DataFrame:
+def load_injuries(conn: psycopg.Connection, fixture_ids: list[int] | None = None) -> pd.DataFrame:
+    sql = "SELECT fixture_id, team_id FROM injuries"
+    params = None
+    if fixture_ids is not None:
+        sql += " WHERE fixture_id = ANY(%s)"
+        params = (list(fixture_ids),)
     with conn.cursor() as cur:
-        cur.execute("SELECT fixture_id, team_id FROM injuries")
+        cur.execute(sql, params)
         cols = [d.name for d in cur.description]
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=cols)
 
 
-def load_odds(conn: psycopg.Connection) -> pd.DataFrame:
+def load_odds(conn: psycopg.Connection, fixture_ids: list[int] | None = None) -> pd.DataFrame:
     """Снимки коэффициентов до кикоффа, для ДП-10 (eval-колонки)."""
     sql = """
         SELECT s.fixture_id, s.taken_at, b.name AS bookmaker, bt.name AS bet_type, v.value, v.odd
@@ -142,8 +246,12 @@ def load_odds(conn: psycopg.Connection) -> pd.DataFrame:
         JOIN bet_types bt ON bt.bet_type_id = v.bet_type_id
         WHERE b.name IN ('1xBet', 'Pinnacle')
     """
+    params = None
+    if fixture_ids is not None:
+        sql += " AND s.fixture_id = ANY(%s)"
+        params = (list(fixture_ids),)
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, params)
         cols = [d.name for d in cur.description]
         rows = cur.fetchall()
     df = pd.DataFrame(rows, columns=cols)
@@ -750,28 +858,23 @@ def compute_eval_odds(fx: pd.DataFrame, odds: pd.DataFrame, lines: pd.DataFrame)
 # --------------------------------------------------------------------- сборка
 
 
-def build(conn: psycopg.Connection, include_upcoming: bool = False, horizon_days: int | None = None) -> pd.DataFrame:
-    """Строит полную таблицу признаков (без записи в базу).
-
-    `include_upcoming` (--upcoming) добавляет к истории ещё не сыгранные
-    матчи в горизонте `horizon_days` дней — их целевые колонки останутся
-    NULL, историю это не меняет (см. модульный докстринг)."""
-    fx = load_fixtures(conn, include_upcoming=include_upcoming, horizon_days=horizon_days)
-    fx = compute_targets(fx)
-    fx = compute_league_lines(fx)
-
-    long_df = _team_long_format(fx)
-    fx = compute_team_lines(fx, long_df)
-
+def _assemble_result(
+    fx: pd.DataFrame,
+    long_df: pd.DataFrame,
+    stats_raw: pd.DataFrame,
+    injuries_raw: pd.DataFrame,
+    odds_raw: pd.DataFrame,
+    elo_df: pd.DataFrame,
+    final_ratings: dict,
+) -> pd.DataFrame:
+    """Общая часть `build`/`build_upcoming`: считает всё, что зависит только
+    от уже готовых `fx`/`long_df` и заранее загруженных сырых таблиц, и
+    сводит в одну широкую таблицу."""
     form = compute_form(long_df)
-    stats_raw = load_statistics(conn)
     stats = compute_statistics_features(long_df, stats_raw)
     h2h = compute_h2h(fx)
-    injuries_raw = load_injuries(conn)
     injuries = compute_injuries(fx, injuries_raw)
     standings = compute_standings(fx, long_df)
-    elo_df, final_ratings = compute_elo(fx)
-    odds_raw = load_odds(conn)
     eval_odds = compute_eval_odds(
         fx, odds_raw, fx[["fixture_id", "league_total_line", "home_team_line", "away_team_line", "handicap_favorite", "handicap_line"]]
     )
@@ -788,6 +891,85 @@ def build(conn: psycopg.Connection, include_upcoming: bool = False, horizon_days
     result = result.merge(eval_odds, on="fixture_id", how="left")
     result.attrs["elo_final_ratings"] = final_ratings
     return result
+
+
+def build(conn: psycopg.Connection) -> pd.DataFrame:
+    """Строит полную таблицу признаков (без записи в базу)."""
+    fx = load_fixtures(conn)
+    fx = compute_targets(fx)
+    fx = compute_league_lines(fx)
+
+    long_df = _team_long_format(fx)
+    fx = compute_team_lines(fx, long_df)
+
+    stats_raw = load_statistics(conn)
+    injuries_raw = load_injuries(conn)
+    odds_raw = load_odds(conn)
+    elo_df, final_ratings = compute_elo(fx)
+    return _assemble_result(fx, long_df, stats_raw, injuries_raw, odds_raw, elo_df, final_ratings)
+
+
+def build_upcoming(conn: psycopg.Connection, horizon_days: int | None = None) -> pd.DataFrame:
+    """Лёгкая версия `build()` для `--upcoming` (ДП-9а).
+
+    В отличие от `build()`, не читает всю историю (981 тыс.+ строк на
+    30.09.2026 — тот же объём, что и полный пересчёт, из-за которого он
+    не запускается на сервере напрямую), а только то, что действительно
+    нужно для конкретных будущих матчей в горизонте:
+
+    - `(league_id, season)` затронутых лиг — для линий (ДП-2), формы
+      (ДП-3), статистики (ДП-4) и турнирной таблицы (ДП-7): все они либо
+      считаются в рамках текущего сезона лиги, либо (форма/статистика)
+      не заглядывают дальше последних `SHORT_WINDOW`/`LONG_WINDOW` матчей
+      внутри него — прошлые сезоны и другие лиги ничего не меняют;
+    - конкретные пары команд — для личных встреч (ДП-5, сквозные по всем
+      сезонам);
+    - уже посчитанное состояние Эло (`ml_team_elo_state`) вместо полного
+      последовательного пересчёта (ДП-8) — рейтинг команды на текущий
+      момент и есть её «предматчевый» рейтинг для будущей игры, повторно
+      проходить всю историю ради этого числа не нужно.
+
+    На проде (30.09.2026, горизонт 2 дня) это ~7 тыс. строк истории вместо
+    981 тыс. — на два порядка меньше, безопасно по памяти для cron
+    на сервере."""
+    upcoming = load_upcoming_fixtures(conn, horizon_days=horizon_days)
+    if upcoming.empty:
+        columns = ["fixture_id"] + [name for name, _ in all_columns()]
+        return pd.DataFrame(columns=columns)
+
+    league_seasons = sorted(set(zip(upcoming["league_id"].tolist(), upcoming["season"].tolist())))
+    season_history = load_season_history(conn, league_seasons)
+
+    pairs = sorted({(min(h, a), max(h, a)) for h, a in zip(upcoming["home_team_id"], upcoming["away_team_id"])})
+    h2h_history = load_h2h_history(conn, pairs)
+
+    fx = pd.concat([season_history, h2h_history, upcoming], ignore_index=True)
+    fx = fx.drop_duplicates(subset="fixture_id", keep="first").reset_index(drop=True)
+    fx["kickoff_at"] = pd.to_datetime(fx["kickoff_at"], utc=True)
+
+    fx = compute_targets(fx)
+    fx = compute_league_lines(fx)
+    long_df = _team_long_format(fx)
+    fx = compute_team_lines(fx, long_df)
+
+    history_ids = fx["fixture_id"].tolist()
+    stats_raw = load_statistics(conn, fixture_ids=history_ids)
+    upcoming_ids = upcoming["fixture_id"].tolist()
+    injuries_raw = load_injuries(conn, fixture_ids=upcoming_ids)
+    odds_raw = load_odds(conn, fixture_ids=upcoming_ids)
+
+    # Текущий рейтинг команды = её предматчевый рейтинг для будущей игры —
+    # без последовательного пересчёта (см. докстринг выше).
+    elo_state = load_elo_state(conn)
+    home_elo = [elo_state.get((tid, lid), ELO_DEFAULT) for tid, lid in zip(fx["home_team_id"], fx["league_id"])]
+    away_elo = [elo_state.get((tid, lid), ELO_DEFAULT) for tid, lid in zip(fx["away_team_id"], fx["league_id"])]
+    elo_df = pd.DataFrame({"fixture_id": fx["fixture_id"], "home_team_elo": home_elo, "away_team_elo": away_elo})
+    elo_df["elo_diff"] = elo_df["home_team_elo"] - elo_df["away_team_elo"]
+
+    result = _assemble_result(fx, long_df, stats_raw, injuries_raw, odds_raw, elo_df, final_ratings={})
+    # season_history/h2h_history — только основа для скользящих признаков,
+    # в выводе (и в записи) нужны исключительно сами будущие матчи.
+    return result[result["fixture_id"].isin(upcoming_ids)].reset_index(drop=True)
 
 
 def _pivot_side_features(long_features: pd.DataFrame, prefix: str) -> pd.DataFrame:
@@ -1014,23 +1196,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--upcoming и --incremental нельзя использовать вместе")
 
     url = database_url()
-    with connect(url) as conn:
-        df = build(conn, include_upcoming=args.upcoming, horizon_days=args.horizon_days if args.upcoming else None)
 
     # Запись — отдельными короткими соединениями (write_features_resilient,
     # write_elo_state_resilient), не одной долгоживущей `conn`: см. их
     # докстринги про обрывы и зависания на проде.
     if args.upcoming:
-        # Пишем только сами несыгранные строки — история и так уже в базе
-        # (не изменилась), переписывать её заново незачем. reg_home NULL —
-        # надёжный признак «матч ещё не сыгран»: у финализированных строк
-        # он всегда заполнен (compute_targets либо считает его, либо
-        # выбрасывает завершённый матч без счёта как дефект данных).
-        upcoming_df = df[df["reg_home"].isna()]
-        written = write_features_resilient(url, upcoming_df, incremental=False)
+        with connect(url) as conn:
+            df = build_upcoming(conn, horizon_days=args.horizon_days)
+        if df.empty:
+            print(f"нет матчей в горизонте {args.horizon_days} дн. — писать нечего")
+            return 0
+        written = write_features_resilient(url, df, incremental=False)
         print(f"признаки будущих матчей записаны: {written} (горизонт {args.horizon_days} дн.)")
         return 0
 
+    with connect(url) as conn:
+        df = build(conn)
     written = write_features_resilient(url, df, incremental=args.incremental)
     write_elo_state_resilient(url, df, df.attrs.get("elo_final_ratings", {}))
     print(f"строк записано: {written} (всего вычислено: {len(df)})")

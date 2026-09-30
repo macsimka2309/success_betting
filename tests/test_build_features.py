@@ -412,20 +412,22 @@ def conn():
         yield connection
 
 
-def _seed_season(conn, league_id=39, season=2026, n_matches=25):
+def _seed_season(conn, league_id=39, season=2026, n_matches=25, fixture_offset=0):
     with conn.cursor() as cur:
         cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (%s, 'PL', true)", (league_id,))
         cur.execute("INSERT INTO league_seasons (league_id, season) VALUES (%s, %s)", (league_id, season))
         team_ids = list(range(1, 9))
         for tid in team_ids:
-            cur.execute("INSERT INTO teams (team_id, name) VALUES (%s, %s)", (tid, f"Team {tid}"))
+            cur.execute(
+                "INSERT INTO teams (team_id, name) VALUES (%s, %s) ON CONFLICT DO NOTHING", (tid, f"Team {tid}")
+            )
         for i in range(n_matches):
             home, away = team_ids[i % 8], team_ids[(i + 1) % 8]
             cur.execute(
                 """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
                    status_short, home_team_id, away_team_id, goals_home, goals_away)
                    VALUES (%s, %s, %s, %s, %s, 'FT', %s, %s, %s, %s)""",
-                (1000 + i, league_id, season, ts(1 + i), ts(1 + i).date(), home, away, i % 3, i % 2),
+                (1000 + fixture_offset + i, league_id, season, ts(1 + i), ts(1 + i).date(), home, away, i % 3, i % 2),
             )
 
 
@@ -583,31 +585,69 @@ def _insert_upcoming_fixture(conn, fixture_id, league_id, season, home, away, ki
         )
 
 
-def test_load_fixtures_upcoming_respects_horizon(conn):
+def test_load_upcoming_fixtures_respects_horizon(conn):
     _seed_season(conn, n_matches=5)
     now = datetime.now(timezone.utc)
     _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
     _insert_upcoming_fixture(conn, 9002, 39, 2026, 1, 2, now + timedelta(days=30))
 
-    df = bf.load_fixtures(conn, include_upcoming=True, horizon_days=7)
+    df = bf.load_upcoming_fixtures(conn, horizon_days=7)
     ids = set(df["fixture_id"])
     assert 9001 in ids
     assert 9002 not in ids  # за горизонтом
 
 
-def test_build_upcoming_computes_features_without_targets(conn):
+def test_load_season_history_scoped_to_affected_league_seasons(conn):
+    """build_upcoming не должен читать всю базу (981к+ строк на проде) —
+    только текущий сезон тех лиг, что реально есть в --upcoming наборе."""
+    _seed_season(conn, league_id=39, season=2026, n_matches=5)
+    _seed_season(conn, league_id=61, season=2026, n_matches=5, fixture_offset=100)  # другая лига
+
+    df = bf.load_season_history(conn, [(39, 2026)])
+    assert set(df["league_id"]) == {39}
+    assert len(df) == 5
+
+
+def test_load_season_history_empty_league_seasons_returns_empty_df():
+    df = bf.load_season_history(conn=None, league_seasons=[])
+    assert df.empty
+    assert "fixture_id" in df.columns
+
+
+def test_build_upcoming_returns_only_upcoming_rows_with_features_and_no_targets(conn):
     _seed_season(conn, n_matches=25)
     now = datetime.now(timezone.utc)
     _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
 
-    df = bf.build(conn, include_upcoming=True, horizon_days=7)
-    upcoming = df[df["fixture_id"] == 9001].iloc[0]
+    df = bf.build_upcoming(conn, horizon_days=7)
+    assert list(df["fixture_id"]) == [9001]  # только сама будущая строка, не история-основа
+    upcoming = df.iloc[0]
     assert pd.isna(upcoming["reg_home"])
     assert upcoming["result_1x2"] is None
-    assert pd.notna(upcoming["home_team_elo"])  # признак посчитан по истории
+    assert pd.notna(upcoming["home_team_elo"])  # признак посчитан по сохранённому состоянию Эло
 
-    finished = df[df["fixture_id"] == 1000].iloc[0]
-    assert pd.notna(finished["reg_home"])  # история не пострадала
+
+def test_build_upcoming_uses_persisted_elo_state_not_full_recompute(conn):
+    """Ключевая оптимизация (ДП-9а): рейтинг берётся из ml_team_elo_state
+    как есть, без последовательного прохода по всей истории — иначе
+    --upcoming был бы так же тяжёл по памяти, как полный пересчёт."""
+    _seed_season(conn, n_matches=5)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ml_team_elo_state (team_id, league_id, rating, as_of_fixture_id) VALUES (1, 39, 1777.0, 1000)"
+        )
+    now = datetime.now(timezone.utc)
+    _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
+
+    df = bf.build_upcoming(conn, horizon_days=7)
+    assert float(df.iloc[0]["home_team_elo"]) == pytest.approx(1777.0)
+
+
+def test_build_upcoming_empty_horizon_returns_empty_df_with_columns(conn):
+    _seed_season(conn, n_matches=3)
+    df = bf.build_upcoming(conn, horizon_days=2)  # нет NS-матчей в горизонте
+    assert df.empty
+    assert "fixture_id" in df.columns
 
 
 def test_upcoming_mode_writes_only_unplayed_rows_without_touching_history(conn):
@@ -615,11 +655,10 @@ def test_upcoming_mode_writes_only_unplayed_rows_without_touching_history(conn):
     now = datetime.now(timezone.utc)
     _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
 
-    df = bf.build(conn, include_upcoming=True, horizon_days=7)
-    upcoming_df = df[df["reg_home"].isna()]
-    assert list(upcoming_df["fixture_id"]) == [9001]
+    df = bf.build_upcoming(conn, horizon_days=7)
+    assert list(df["fixture_id"]) == [9001]
 
-    written = bf.write_features(conn, upcoming_df, incremental=False)
+    written = bf.write_features(conn, df, incremental=False)
     assert written == 1
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM ml_match_features")
