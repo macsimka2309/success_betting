@@ -388,6 +388,44 @@ def test_write_features_writes_in_kickoff_order_regardless_of_input_order(conn):
     assert dates_written == sorted(dates_written)
 
 
+def test_write_features_resilient_matches_write_features(conn):
+    """Тот же результат, что и обычная запись — разница только в том, как
+    держится соединение (одно на всё vs новое на пакет), не в данных."""
+    _seed_season(conn, n_matches=10)
+    df = bf.build(conn)
+
+    written = bf.write_features_resilient(TEST_URL, df, incremental=False, batch_size=3)
+
+    assert written == 10
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ml_match_features")
+        assert cur.fetchone()[0] == 10
+
+
+def test_write_features_resilient_retries_failed_batch(conn, monkeypatch):
+    """Обрыв соединения на одном пакете повторяется с новым соединением,
+    а не роняет всю запись (найдено на проде 30.09.2026)."""
+    _seed_season(conn, n_matches=6)
+    df = bf.build(conn)
+
+    real_connect = bf.connect
+    attempts = {"n": 0}
+
+    def flaky_connect(url):
+        attempts["n"] += 1
+        if attempts["n"] == 2:  # второй пакет — первая попытка обрывается
+            raise psycopg.OperationalError("server closed the connection unexpectedly")
+        return real_connect(url)
+
+    monkeypatch.setattr(bf, "connect", flaky_connect)
+    written = bf.write_features_resilient(TEST_URL, df, incremental=False, batch_size=2, max_attempts=3)
+
+    assert written == 6
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ml_match_features")
+        assert cur.fetchone()[0] == 6
+
+
 def test_incremental_writes_only_new_matches(conn):
     _seed_season(conn, n_matches=20)
     df = bf.build(conn)

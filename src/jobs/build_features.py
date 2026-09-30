@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import date
 
 import numpy as np
@@ -762,6 +763,66 @@ def write_features(conn: psycopg.Connection, df: pd.DataFrame, incremental: bool
     return len(rows)
 
 
+def write_features_resilient(
+    url: str, df: pd.DataFrame, incremental: bool, batch_size: int = 2_000, max_attempts: int = 5
+) -> int:
+    """Как `write_features`, но открывает новое соединение на каждый пакет.
+
+    Нужно для записи через нестабильный канал (SSH-туннель через
+    нестабильную сеть): на проде 30.09.2026 три подряд полных прогона
+    обрывались посередине записи одним держащимся открытым соединением
+    ("server closed the connection unexpectedly") — похоже на разрыв
+    долгоживущего TCP где-то на сетевом пути, не связанный ни с Postgres,
+    ни с самим кодом (сервер и контейнер оставались здоровы все три раза).
+    Короткое соединение на пакет из ~2000 строк живёт секунды, а не
+    десятки минут, поэтому куда менее уязвимо к такому разрыву; при сбое
+    повторяет именно тот же пакет с новым соединением, а не всё сначала.
+    """
+    df = df.sort_values(["kickoff_at", "fixture_id"])
+    columns = ["fixture_id"] + [name for name, _ in all_columns()]
+    if incremental:
+        with connect(url) as conn, conn.cursor() as cur:
+            cur.execute("SELECT max(kickoff_at) FROM ml_match_features")
+            row = cur.fetchone()
+            last = row[0] if row else None
+        if last is not None:
+            df = df[pd.to_datetime(df["kickoff_at"], utc=True) > last]
+
+    if df.empty:
+        return 0
+
+    payload = df[columns].copy()
+    payload = payload.astype(object).where(payload.notna(), None)
+    rows = [tuple(r) for r in payload.itertuples(index=False)]
+
+    placeholders = ", ".join(["%s"] * len(columns))
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != "fixture_id")
+    sql = (
+        f"INSERT INTO ml_match_features ({', '.join(columns)}) VALUES ({placeholders}) "
+        f"ON CONFLICT (fixture_id) DO UPDATE SET {updates}, computed_at = now()"
+    )
+
+    written = 0
+    total_batches = -(-len(rows) // batch_size)
+    for i, start in enumerate(range(0, len(rows), batch_size), 1):
+        chunk = rows[start : start + batch_size]
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with connect(url) as conn, conn.cursor() as cur:
+                    with conn.transaction():
+                        cur.executemany(sql, chunk)
+                break
+            except psycopg.OperationalError as error:
+                if attempt == max_attempts:
+                    raise
+                print(f"  пакет {i}/{total_batches}: {error}; повтор {attempt}/{max_attempts}")
+                time.sleep(min(30, 2**attempt))
+        written += len(chunk)
+        if i % 20 == 0 or i == total_batches:
+            print(f"  записано пакетов: {i}/{total_batches} ({written} строк)")
+    return written
+
+
 def write_elo_state(conn: psycopg.Connection, fx: pd.DataFrame, ratings: dict[tuple[int, int], float]) -> None:
     """Сохраняет итоговый рейтинг Эло и матч, на котором он посчитан последним."""
     with conn.cursor() as cur:
@@ -794,11 +855,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--incremental", action="store_true", help="писать только новые матчи")
     args = parser.parse_args(argv)
 
-    with connect(database_url()) as conn:
+    url = database_url()
+    with connect(url) as conn:
         df = build(conn)
-        written = write_features(conn, df, incremental=args.incremental)
+    # Запись — отдельными короткими соединениями (write_features_resilient),
+    # не той же долгоживущей `conn`: см. её докстринг про обрывы на проде.
+    written = write_features_resilient(url, df, incremental=args.incremental)
+    with connect(url) as conn:
         write_elo_state(conn, df, df.attrs.get("elo_final_ratings", {}))
-        print(f"строк записано: {written} (всего вычислено: {len(df)})")
+    print(f"строк записано: {written} (всего вычислено: {len(df)})")
     return 0
 
 
