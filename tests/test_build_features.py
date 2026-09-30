@@ -32,14 +32,24 @@ def ts(day: int, month: int = 1, year: int = 2026, hour: int = 15) -> datetime:
 
 def make_fixtures_df(rows: list[dict]) -> pd.DataFrame:
     """rows: fixture_id, league_id, season, home_team_id, away_team_id,
-    kickoff_at, goals_home, goals_away, (ft90_home/away опционально)."""
+    kickoff_at, goals_home, goals_away, (ft90_home/away, status_short опционально)."""
     df = pd.DataFrame(rows)
     for col in ("ft90_home", "ft90_away"):
         if col not in df.columns:
             df[col] = np.nan
     df["match_date"] = df["kickoff_at"].dt.date
-    df["status_short"] = "FT"
+    if "status_short" not in df.columns:
+        df["status_short"] = "FT"
     return df
+
+
+def make_upcoming_row(fixture_id: int, league_id: int, season: int, home: int, away: int, kickoff_at) -> dict:
+    """Строка ещё не сыгранного матча (--upcoming): без счёта, статус NS."""
+    return {
+        "fixture_id": fixture_id, "league_id": league_id, "season": season,
+        "home_team_id": home, "away_team_id": away, "kickoff_at": kickoff_at,
+        "goals_home": None, "goals_away": None, "status_short": "NS",
+    }
 
 
 # -------------------------------------------------------------------- half_line
@@ -250,6 +260,98 @@ def test_h2h_computed_from_two_matches_perspective_of_current_home_team():
     assert row["h2h_home_team_win_rate"] == pytest.approx(0.5)  # команда 10 выиграла 1 из 2
     assert row["h2h_draw_rate"] == pytest.approx(0.5)
     assert row["h2h_away_team_win_rate"] == pytest.approx(0.0)
+
+
+# ------------------------------------------------------------- upcoming (ДП-9)
+
+
+def test_targets_upcoming_match_has_null_targets_not_dropped():
+    """NS-матч (--upcoming) без счёта — не дефект данных (в отличие от
+    FT без счёта), строка не выбрасывается, целевые колонки — NULL."""
+    rows = [
+        {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 20, "kickoff_at": ts(1), "goals_home": 2, "goals_away": 1},
+        make_upcoming_row(2, 1, 2026, 10, 30, ts(8)),
+    ]
+    out = bf.compute_targets(make_fixtures_df(rows))
+    assert list(out["fixture_id"]) == [1, 2]  # upcoming не выброшен
+    upcoming = out[out["fixture_id"] == 2].iloc[0]
+    assert pd.isna(upcoming["reg_home"]) and pd.isna(upcoming["reg_away"])
+    assert upcoming["result_1x2"] is None
+    assert upcoming["btts"] is None
+    assert upcoming["dc_1x"] is None and upcoming["dc_x2"] is None and upcoming["dc_12"] is None
+    finished = out[out["fixture_id"] == 1].iloc[0]
+    assert finished["result_1x2"] == "H"  # завершённый матч считается как обычно
+
+
+def test_league_line_valid_but_league_total_over_null_for_upcoming():
+    """league_total_line — предсказательный признак, валиден и для будущего
+    матча; league_total_over — по факту счёта, у будущего матча остаётся NULL."""
+    finished = [
+        {"fixture_id": 100 + i, "league_id": 1, "season": 2026,
+         "home_team_id": 10 + (i % 4), "away_team_id": 20 + (i % 4),
+         "kickoff_at": ts(1 + i), "goals_home": 1, "goals_away": 1}
+        for i in range(20)
+    ]
+    rows = finished + [make_upcoming_row(200, 1, 2026, 10, 21, ts(1, 2))]
+    df = bf.compute_targets(make_fixtures_df(rows))
+    df = bf.compute_league_lines(df)
+    upcoming = df[df["fixture_id"] == 200].iloc[0]
+    assert pd.notna(upcoming["league_total_line"])
+    assert pd.isna(upcoming["league_total_over"])
+
+
+def test_form_two_upcoming_matches_in_horizon_do_not_pollute_each_other():
+    """Команда играет дважды в горизонте --upcoming (например, две игры за
+    неделю): первый ещё не сыгранный матч не должен войти в форму второго."""
+    rows = [
+        {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 20, "kickoff_at": ts(1), "goals_home": 2, "goals_away": 0},
+        {"fixture_id": 2, "league_id": 1, "season": 2026, "home_team_id": 30,
+         "away_team_id": 10, "kickoff_at": ts(8), "goals_home": 1, "goals_away": 1},
+        make_upcoming_row(3, 1, 2026, 10, 40, ts(15)),   # upcoming #1
+        make_upcoming_row(4, 1, 2026, 50, 10, ts(18)),   # upcoming #2, позже
+    ]
+    df = bf.compute_targets(make_fixtures_df(rows))
+    long_df = bf._team_long_format(df)
+    form = bf.compute_form(long_df)
+    before_first_upcoming = form[(form["fixture_id"] == 3) & (form["team_id"] == 10)].iloc[0]
+    before_second_upcoming = form[(form["fixture_id"] == 4) & (form["team_id"] == 10)].iloc[0]
+    assert before_first_upcoming["form__overall__short__matches_played"] == 2
+    assert before_second_upcoming["form__overall__short__matches_played"] == 2  # не 3
+    assert before_first_upcoming["form__overall__short__goals_scored_avg"] == before_second_upcoming[
+        "form__overall__short__goals_scored_avg"
+    ]
+
+
+def test_elo_does_not_update_from_upcoming_match():
+    rows = [
+        {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 20, "kickoff_at": ts(1), "goals_home": 2, "goals_away": 0},
+        make_upcoming_row(2, 1, 2026, 10, 30, ts(8)),
+        make_upcoming_row(3, 1, 2026, 40, 10, ts(15)),
+    ]
+    df = bf.compute_targets(make_fixtures_df(rows))
+    elo_df, ratings = bf.compute_elo(df)
+    elo_before_first_upcoming = elo_df[elo_df["fixture_id"] == 2].iloc[0]["home_team_elo"]
+    elo_before_second_upcoming = elo_df[elo_df["fixture_id"] == 3].iloc[0]["away_team_elo"]
+    assert elo_before_first_upcoming == pytest.approx(elo_before_second_upcoming)  # не сдвинулся
+
+
+def test_standings_upcoming_match_does_not_advance_table():
+    rows = [
+        {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 20, "kickoff_at": ts(1), "goals_home": 3, "goals_away": 0},
+        make_upcoming_row(2, 1, 2026, 10, 30, ts(8)),
+        make_upcoming_row(3, 1, 2026, 40, 10, ts(15)),
+    ]
+    df = bf.compute_targets(make_fixtures_df(rows))
+    long_df = bf._team_long_format(df)
+    standings = bf.compute_standings(df, long_df)
+    points_before_first_upcoming = standings[standings["fixture_id"] == 2].iloc[0]["home_team_points"]
+    points_before_second_upcoming = standings[standings["fixture_id"] == 3].iloc[0]["away_team_points"]
+    assert points_before_first_upcoming == 3  # только матч 1 (победа)
+    assert points_before_second_upcoming == 3  # матч 2 (upcoming) не добавил очков
 
 
 # ------------------------------------------------------------------- Эло
@@ -469,6 +571,83 @@ def test_write_elo_state_resilient_matches_batch_write(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM ml_team_elo_state")
         assert cur.fetchone()[0] == len(ratings)
+
+
+def _insert_upcoming_fixture(conn, fixture_id, league_id, season, home, away, kickoff_at):
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
+               status_short, home_team_id, away_team_id, goals_home, goals_away)
+               VALUES (%s, %s, %s, %s, %s, 'NS', %s, %s, NULL, NULL)""",
+            (fixture_id, league_id, season, kickoff_at, kickoff_at.date(), home, away),
+        )
+
+
+def test_load_fixtures_upcoming_respects_horizon(conn):
+    _seed_season(conn, n_matches=5)
+    now = datetime.now(timezone.utc)
+    _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
+    _insert_upcoming_fixture(conn, 9002, 39, 2026, 1, 2, now + timedelta(days=30))
+
+    df = bf.load_fixtures(conn, include_upcoming=True, horizon_days=7)
+    ids = set(df["fixture_id"])
+    assert 9001 in ids
+    assert 9002 not in ids  # за горизонтом
+
+
+def test_build_upcoming_computes_features_without_targets(conn):
+    _seed_season(conn, n_matches=25)
+    now = datetime.now(timezone.utc)
+    _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
+
+    df = bf.build(conn, include_upcoming=True, horizon_days=7)
+    upcoming = df[df["fixture_id"] == 9001].iloc[0]
+    assert pd.isna(upcoming["reg_home"])
+    assert upcoming["result_1x2"] is None
+    assert pd.notna(upcoming["home_team_elo"])  # признак посчитан по истории
+
+    finished = df[df["fixture_id"] == 1000].iloc[0]
+    assert pd.notna(finished["reg_home"])  # история не пострадала
+
+
+def test_upcoming_mode_writes_only_unplayed_rows_without_touching_history(conn):
+    _seed_season(conn, n_matches=5)
+    now = datetime.now(timezone.utc)
+    _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
+
+    df = bf.build(conn, include_upcoming=True, horizon_days=7)
+    upcoming_df = df[df["reg_home"].isna()]
+    assert list(upcoming_df["fixture_id"]) == [9001]
+
+    written = bf.write_features(conn, upcoming_df, incremental=False)
+    assert written == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ml_match_features")
+        assert cur.fetchone()[0] == 1  # история отдельно не переписывалась этим прогоном
+        cur.execute("SELECT result_1x2, home_team_elo FROM ml_match_features WHERE fixture_id = 9001")
+        result, elo = cur.fetchone()
+        assert result is None
+        assert elo is not None
+
+
+def test_main_upcoming_flag_writes_upcoming_and_skips_elo_state(conn, monkeypatch):
+    _seed_season(conn, n_matches=5)
+    now = datetime.now(timezone.utc)
+    _insert_upcoming_fixture(conn, 9001, 39, 2026, 1, 2, now + timedelta(days=2))
+
+    monkeypatch.setenv("DATABASE_URL", TEST_URL)
+    rc = bf.main(["--upcoming", "--horizon-days", "7"])
+    assert rc == 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ml_match_features")
+        assert cur.fetchone()[0] == 1
+        cur.execute("SELECT count(*) FROM ml_team_elo_state")
+        assert cur.fetchone()[0] == 0  # --upcoming не трогает состояние Эло
+
+
+def test_main_rejects_upcoming_with_incremental():
+    with pytest.raises(SystemExit):
+        bf.main(["--upcoming", "--incremental"])
 
 
 def test_injuries_counted_without_leaking_across_matches(conn):

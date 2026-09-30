@@ -13,9 +13,20 @@
 корректно, но не быстрее полного прохода. Оптимизация — на будущее,
 когда/если станет ощутимо медленно для еженедельного запуска (ДП-12).
 
+Режим `--upcoming` — инференс на ещё не сыгранные матчи (ДП-9 расширение):
+считает те же признаки для несыгранных матчей в горизонте `--horizon-days`
+от текущего момента, используя всю прошлую историю как основание для
+скользящих метрик (утечки нет — история идёт только до текущего момента,
+а сам факт будущего матча не даёт ничего вперёд), но не записывает и не
+меняет исторические строки и состояние Эло: целевые колонки (`reg_home`,
+`result_1x2`, `btts` и т.д.) у таких строк остаются NULL, потому что
+результата ещё нет. Строка перезаписывается тем же upsert'ом, когда матч
+будет сыгран и рассчитан обычным (не `--upcoming`) прогоном.
+
 Использование:
     python3 -m src.jobs.build_features                 # полный пересчёт
     python3 -m src.jobs.build_features --incremental
+    python3 -m src.jobs.build_features --upcoming [--horizon-days 7]
 """
 
 from __future__ import annotations
@@ -39,6 +50,8 @@ SHORT_WINDOW = 3
 LONG_WINDOW = 5
 H2H_WINDOW = 5
 FINISHED_STATUSES = ("FT", "AET", "PEN")
+UPCOMING_STATUS = "NS"
+DEFAULT_UPCOMING_HORIZON_DAYS = 7
 
 ELO_DEFAULT = 1500.0
 ELO_K = 20.0
@@ -65,17 +78,32 @@ def half_line(x: pd.Series) -> pd.Series:
 # --------------------------------------------------------------------- чтение
 
 
-def load_fixtures(conn: psycopg.Connection) -> pd.DataFrame:
+def load_fixtures(
+    conn: psycopg.Connection, include_upcoming: bool = False, horizon_days: int | None = None
+) -> pd.DataFrame:
+    """Завершённые матчи (для целей и истории) плюс, при `include_upcoming`,
+    ещё не сыгранные матчи в горизонте `horizon_days` дней вперёд от текущего
+    момента (`--upcoming`, инференс) — им не хватает счёта, поэтому дальше
+    по пайплайну они остаются с NULL в целевых колонках."""
     sql = """
         SELECT fixture_id, league_id, season, match_date, kickoff_at,
                home_team_id, away_team_id, status_short,
                goals_home, goals_away, ft90_home, ft90_away
         FROM fixtures
-        WHERE status_short = ANY(%s)
-        ORDER BY kickoff_at, fixture_id
+        WHERE status_short = ANY(%(finished)s)
     """
+    params: dict = {"finished": list(FINISHED_STATUSES)}
+    if include_upcoming:
+        sql += """
+            OR (status_short = %(upcoming_status)s
+                AND kickoff_at >= now()
+                AND kickoff_at < now() + (%(horizon_days)s || ' days')::interval)
+        """
+        params["upcoming_status"] = UPCOMING_STATUS
+        params["horizon_days"] = str(horizon_days or DEFAULT_UPCOMING_HORIZON_DAYS)
+    sql += " ORDER BY kickoff_at, fixture_id"
     with conn.cursor() as cur:
-        cur.execute(sql, (list(FINISHED_STATUSES),))
+        cur.execute(sql, params)
         cols = [d.name for d in cur.description]
         rows = cur.fetchall()
     df = pd.DataFrame(rows, columns=cols)
@@ -147,7 +175,11 @@ def compute_targets(fx: pd.DataFrame) -> pd.DataFrame:
     # а не протаскивается дальше с NA — иначе np.select ниже упал бы
     # на нечистом булевом массиве (нашлось именно так, тестами на
     # синтетических данных со всегда полным счётом это не поймать).
-    missing_score = fx["reg_home"].isna() | fx["reg_away"].isna()
+    # Отсутствие счёта — дефект данных только у завершённых матчей; у ещё
+    # не сыгранных (--upcoming, ДП-9-расширение) счёта нет по определению,
+    # такие строки не выбрасываем.
+    is_finished = fx["status_short"].isin(FINISHED_STATUSES)
+    missing_score = is_finished & (fx["reg_home"].isna() | fx["reg_away"].isna())
     if missing_score.any():
         print(
             f"  пропущено матчей без счёта при завершённом статусе: {int(missing_score.sum())} "
@@ -155,14 +187,28 @@ def compute_targets(fx: pd.DataFrame) -> pd.DataFrame:
         )
         fx = fx.loc[~missing_score].copy()
 
-    conditions = [fx["reg_home"] > fx["reg_away"], fx["reg_home"] < fx["reg_away"]]
-    fx["result_1x2"] = np.select(conditions, ["H", "A"], default="D")
-    fx["total_goals"] = fx["reg_home"] + fx["reg_away"]
-    fx["btts"] = (fx["reg_home"] > 0) & (fx["reg_away"] > 0)
+    # Сыгран ли матч — единственный признак, по которому целевые колонки
+    # ниже либо считаются, либо остаются NULL (--upcoming): np.select и
+    # сравнения с NaN сами по себе дают False/"D" вместо NULL, поэтому
+    # результат явно маскируется через `played`.
+    played = fx["reg_home"].notna() & fx["reg_away"].notna()
 
-    fx["dc_1x"] = fx["result_1x2"].isin(["H", "D"])
-    fx["dc_x2"] = fx["result_1x2"].isin(["A", "D"])
-    fx["dc_12"] = fx["result_1x2"].isin(["H", "A"])
+    # fillna(False): reg_home/reg_away — Int64 (nullable), сравнение с NA
+    # (--upcoming) даёт pandas nullable boolean с <NA>, а не bool ndarray,
+    # на котором падает np.select; итог всё равно перезатирается None ниже
+    # через `played`, поэтому подстановка False тут безопасна.
+    conditions = [
+        (fx["reg_home"] > fx["reg_away"]).fillna(False).to_numpy(dtype=bool),
+        (fx["reg_home"] < fx["reg_away"]).fillna(False).to_numpy(dtype=bool),
+    ]
+    fx["result_1x2"] = np.select(conditions, ["H", "A"], default="D")
+    fx["result_1x2"] = fx["result_1x2"].astype(object).where(played, None)
+    fx["total_goals"] = fx["reg_home"] + fx["reg_away"]
+    fx["btts"] = ((fx["reg_home"] > 0) & (fx["reg_away"] > 0)).astype(object).where(played, None)
+
+    fx["dc_1x"] = fx["result_1x2"].isin(["H", "D"]).astype(object).where(played, None)
+    fx["dc_x2"] = fx["result_1x2"].isin(["A", "D"]).astype(object).where(played, None)
+    fx["dc_12"] = fx["result_1x2"].isin(["H", "A"]).astype(object).where(played, None)
     return fx
 
 
@@ -239,7 +285,12 @@ def compute_league_lines(fx: pd.DataFrame) -> pd.DataFrame:
 
     enough = count >= MIN_LEAGUE_MATCHES
     fx["league_total_line"] = half_line(means["total_goals"]).where(enough)
-    fx["league_total_over"] = (fx["total_goals"] > fx["league_total_line"]).where(fx["league_total_line"].notna())
+    # league_total_line — предсказательный признак, валиден и для ещё не
+    # сыгранных матчей (--upcoming); а вот league_total_over — наблюдение
+    # по факту счёта, поэтому дополнительно маскируется по total_goals.
+    fx["league_total_over"] = (fx["total_goals"] > fx["league_total_line"]).where(
+        fx["league_total_line"].notna() & fx["total_goals"].notna()
+    )
     fx["league_home_win_rate"] = means["_is_home_win"].where(enough)
     fx["league_draw_rate"] = means["_is_draw"].where(enough)
     fx["league_away_win_rate"] = means["_is_away_win"].where(enough)
@@ -294,6 +345,15 @@ def _team_long_format(fx: pd.DataFrame) -> pd.DataFrame:
     long_df["loss"] = long_df["points"] == 0
     long_df["clean_sheet"] = long_df["goals_against"] == 0
     long_df["failed_to_score"] = long_df["goals_for"] == 0
+
+    # Матч ещё не сыгран (--upcoming) — все наблюдённые по факту исхода
+    # метрики должны остаться NULL, а не 0/False, иначе они молча войдут
+    # в скользящее среднее следующего матча той же команды в горизонте
+    # (например, если команда играет дважды за неделю).
+    played = long_df["goals_for"].notna() & long_df["goals_against"].notna()
+    for col in ("points", "win", "draw", "loss", "clean_sheet", "failed_to_score"):
+        long_df[col] = long_df[col].astype(float).where(played)
+
     long_df["team_season_key"] = (
         long_df["team_id"].astype(str) + "|" + long_df["league_id"].astype(str) + "|" + long_df["season"].astype(str)
     )
@@ -314,9 +374,17 @@ def compute_team_lines(fx: pd.DataFrame, long_df: pd.DataFrame) -> pd.DataFrame:
     fx = fx.copy()
     fx["home_team_line"] = fx["fixture_id"].map(lines["home"])
     fx["away_team_line"] = fx["fixture_id"].map(lines["away"])
-    fx["home_total_over"] = (fx["reg_home"] > fx["home_team_line"]).where(fx["home_team_line"].notna())
-    fx["away_total_over"] = (fx["reg_away"] > fx["away_team_line"]).where(fx["away_team_line"].notna())
+    # *_team_line — предсказательный признак, валиден и для несыгранных
+    # матчей (--upcoming); *_total_over — по факту счёта, поэтому требует
+    # ещё и reg_home/reg_away.
+    fx["home_total_over"] = (fx["reg_home"] > fx["home_team_line"]).where(
+        fx["home_team_line"].notna() & fx["reg_home"].notna()
+    )
+    fx["away_total_over"] = (fx["reg_away"] > fx["away_team_line"]).where(
+        fx["away_team_line"].notna() & fx["reg_away"].notna()
+    )
 
+    played = fx["reg_home"].notna() & fx["reg_away"].notna()
     both_known = fx["home_team_line"].notna() & fx["away_team_line"].notna()
     raw = fx["home_team_line"] - fx["away_team_line"]
     fx["handicap_favorite"] = np.where(raw >= 0, "home", "away")
@@ -329,7 +397,7 @@ def compute_team_lines(fx: pd.DataFrame, long_df: pd.DataFrame) -> pd.DataFrame:
     # а не приводится к False — иначе pandas выдаёт FutureWarning на присвоение
     # None булевой колонке (и в будущей версии это станет ошибкой).
     covers = pd.Series(margin, index=fx.index) > fx["handicap_line"]
-    fx["handicap_favorite_covers"] = covers.astype(object).where(both_known, None)
+    fx["handicap_favorite_covers"] = covers.astype(object).where(both_known & played, None)
     return fx
 
 
@@ -466,10 +534,14 @@ def compute_h2h(fx: pd.DataFrame) -> pd.DataFrame:
                         "h2h_away_team_win_rate": None,
                     }
                 )
-            winner_team_id = (
-                row.home_team_id if row.result_1x2 == "H" else row.away_team_id if row.result_1x2 == "A" else None
-            )
-            history.append({"total_goals": row.total_goals, "winner_team_id": winner_team_id})
+            # Несыгранный матч (--upcoming) не добавляем в историю пары —
+            # у него ещё нет исхода, а fixture_id одного и того же горизонта
+            # мог включать две ещё не сыгранные встречи подряд.
+            if pd.notna(row.total_goals):
+                winner_team_id = (
+                    row.home_team_id if row.result_1x2 == "H" else row.away_team_id if row.result_1x2 == "A" else None
+                )
+                history.append({"total_goals": row.total_goals, "winner_team_id": winner_team_id})
     return pd.DataFrame(results)
 
 
@@ -523,8 +595,12 @@ def compute_standings(fx: pd.DataFrame, long_df: pd.DataFrame) -> pd.DataFrame:
                     }
                 )
             for row in rows:
-                cum_points[row.team_id] = cum_points.get(row.team_id, 0) + row.points
-                cum_gd[row.team_id] = cum_gd.get(row.team_id, 0) + row.goal_diff
+                # Несыгранный матч (--upcoming) не двигает турнирную таблицу
+                # вперёд — row.points/goal_diff тут NaN, а NaN в cum_points
+                # безвозвратно испортил бы все последующие снимки для команды.
+                if pd.notna(row.points):
+                    cum_points[row.team_id] = cum_points.get(row.team_id, 0) + row.points
+                    cum_gd[row.team_id] = cum_gd.get(row.team_id, 0) + row.goal_diff
     standings = pd.DataFrame(records)
 
     home = fx[["fixture_id", "home_team_id"]].merge(
@@ -567,14 +643,18 @@ def compute_elo(fx: pd.DataFrame, initial_state: dict[tuple[int, int], float] | 
         home_elo.append(r_home)
         away_elo.append(r_away)
 
-        expected_home = 1.0 / (1.0 + 10 ** (-(r_home + ELO_HOME_ADVANTAGE - r_away) / 400.0))
-        actual_home = {"H": 1.0, "D": 0.5, "A": 0.0}[row.result_1x2]
-        delta = ELO_K * (actual_home - expected_home)
-        ratings[home_key] = r_home + delta
-        ratings[away_key] = r_away - delta
+        # Несыгранный матч (--upcoming) не обновляет рейтинг — у него нет
+        # исхода; home_elo/away_elo (до этой строки) уже зафиксированы выше
+        # как текущее, известное на момент матча значение.
+        if pd.notna(row.result_1x2):
+            expected_home = 1.0 / (1.0 + 10 ** (-(r_home + ELO_HOME_ADVANTAGE - r_away) / 400.0))
+            actual_home = {"H": 1.0, "D": 0.5, "A": 0.0}[row.result_1x2]
+            delta = ELO_K * (actual_home - expected_home)
+            ratings[home_key] = r_home + delta
+            ratings[away_key] = r_away - delta
 
-        league_avg.setdefault(league_id, []).append(ratings[home_key])
-        league_avg[league_id].append(ratings[away_key])
+            league_avg.setdefault(league_id, []).append(ratings[home_key])
+            league_avg[league_id].append(ratings[away_key])
 
     elo_df = fx.sort_values(["kickoff_at", "fixture_id"])[["fixture_id"]].copy()
     elo_df["home_team_elo"] = home_elo
@@ -670,9 +750,13 @@ def compute_eval_odds(fx: pd.DataFrame, odds: pd.DataFrame, lines: pd.DataFrame)
 # --------------------------------------------------------------------- сборка
 
 
-def build(conn: psycopg.Connection) -> pd.DataFrame:
-    """Строит полную таблицу признаков (без записи в базу)."""
-    fx = load_fixtures(conn)
+def build(conn: psycopg.Connection, include_upcoming: bool = False, horizon_days: int | None = None) -> pd.DataFrame:
+    """Строит полную таблицу признаков (без записи в базу).
+
+    `include_upcoming` (--upcoming) добавляет к истории ещё не сыгранные
+    матчи в горизонте `horizon_days` дней — их целевые колонки останутся
+    NULL, историю это не меняет (см. модульный докстринг)."""
+    fx = load_fixtures(conn, include_upcoming=include_upcoming, horizon_days=horizon_days)
     fx = compute_targets(fx)
     fx = compute_league_lines(fx)
 
@@ -913,14 +997,40 @@ def write_elo_state_resilient(url: str, fx: pd.DataFrame, ratings: dict[tuple[in
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Построение таблицы признаков для модели")
     parser.add_argument("--incremental", action="store_true", help="писать только новые матчи")
+    parser.add_argument(
+        "--upcoming",
+        action="store_true",
+        help="признаки для ещё не сыгранных матчей (инференс), не трогает историю и Эло",
+    )
+    parser.add_argument(
+        "--horizon-days",
+        type=int,
+        default=DEFAULT_UPCOMING_HORIZON_DAYS,
+        help=f"горизонт для --upcoming, дней вперёд от текущего момента (по умолчанию {DEFAULT_UPCOMING_HORIZON_DAYS})",
+    )
     args = parser.parse_args(argv)
+
+    if args.upcoming and args.incremental:
+        parser.error("--upcoming и --incremental нельзя использовать вместе")
 
     url = database_url()
     with connect(url) as conn:
-        df = build(conn)
+        df = build(conn, include_upcoming=args.upcoming, horizon_days=args.horizon_days if args.upcoming else None)
+
     # Запись — отдельными короткими соединениями (write_features_resilient,
     # write_elo_state_resilient), не одной долгоживущей `conn`: см. их
     # докстринги про обрывы и зависания на проде.
+    if args.upcoming:
+        # Пишем только сами несыгранные строки — история и так уже в базе
+        # (не изменилась), переписывать её заново незачем. reg_home NULL —
+        # надёжный признак «матч ещё не сыгран»: у финализированных строк
+        # он всегда заполнен (compute_targets либо считает его, либо
+        # выбрасывает завершённый матч без счёта как дефект данных).
+        upcoming_df = df[df["reg_home"].isna()]
+        written = write_features_resilient(url, upcoming_df, incremental=False)
+        print(f"признаки будущих матчей записаны: {written} (горизонт {args.horizon_days} дн.)")
+        return 0
+
     written = write_features_resilient(url, df, incremental=args.incremental)
     write_elo_state_resilient(url, df, df.attrs.get("elo_final_ratings", {}))
     print(f"строк записано: {written} (всего вычислено: {len(df)})")
