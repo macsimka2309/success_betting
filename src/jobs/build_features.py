@@ -847,6 +847,56 @@ def write_elo_state(conn: psycopg.Connection, fx: pd.DataFrame, ratings: dict[tu
             )
 
 
+def write_elo_state_resilient(url: str, fx: pd.DataFrame, ratings: dict[tuple[int, int], float]) -> int:
+    """Как `write_elo_state`, но переподключается на каждую пару (team, league)
+    вместо одного соединения, держащегося открытым на все пары.
+
+    Найдено на проде 30.09.2026: одно долгоживущее соединение на ~3300
+    последовательных мелких запросов зависло НАВСЕГДА (не упало с ошибкой,
+    а просто перестало отвечать — со стороны Postgres на сервере в этот
+    момент не было ни одного активного запроса, то есть локальная сторона
+    ждала ответа, который уже никогда не придёт). Короткие соединения на
+    пару менее уязвимы к такому зависанию, а таймаут на каждой попытке
+    гарантирует, что она не повиснет молча.
+    """
+    written = 0
+    total = len(ratings)
+    for i, ((team_id, league_id), rating) in enumerate(ratings.items(), 1):
+        for attempt in range(1, 4):
+            try:
+                with psycopg.connect(url, connect_timeout=10) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SET statement_timeout = '15s'")
+                        cur.execute(
+                            """SELECT max(fixture_id) FROM (
+                                   SELECT fixture_id FROM fixtures WHERE league_id=%s AND home_team_id=%s
+                                   UNION ALL
+                                   SELECT fixture_id FROM fixtures WHERE league_id=%s AND away_team_id=%s
+                               ) t""",
+                            (league_id, team_id, league_id, team_id),
+                        )
+                        fixture_id = cur.fetchone()[0]
+                        if fixture_id is not None:
+                            cur.execute(
+                                """INSERT INTO ml_team_elo_state (team_id, league_id, rating, as_of_fixture_id)
+                                   VALUES (%s, %s, %s, %s)
+                                   ON CONFLICT (team_id, league_id) DO UPDATE
+                                   SET rating = EXCLUDED.rating, as_of_fixture_id = EXCLUDED.as_of_fixture_id, updated_at = now()""",
+                                (team_id, league_id, rating, fixture_id),
+                            )
+                        conn.commit()
+                written += 1
+                break
+            except (psycopg.OperationalError, psycopg.errors.QueryCanceled) as error:
+                if attempt == 3:
+                    print(f"  пара {i}/{total} (team={team_id}, league={league_id}) не записана: {error}")
+                    break
+                time.sleep(2 * attempt)
+        if i % 500 == 0 or i == total:
+            print(f"  Эло записано: {i}/{total}")
+    return written
+
+
 # ------------------------------------------------------------------------- CLI
 
 
@@ -858,11 +908,11 @@ def main(argv: list[str] | None = None) -> int:
     url = database_url()
     with connect(url) as conn:
         df = build(conn)
-    # Запись — отдельными короткими соединениями (write_features_resilient),
-    # не той же долгоживущей `conn`: см. её докстринг про обрывы на проде.
+    # Запись — отдельными короткими соединениями (write_features_resilient,
+    # write_elo_state_resilient), не одной долгоживущей `conn`: см. их
+    # докстринги про обрывы и зависания на проде.
     written = write_features_resilient(url, df, incremental=args.incremental)
-    with connect(url) as conn:
-        write_elo_state(conn, df, df.attrs.get("elo_final_ratings", {}))
+    write_elo_state_resilient(url, df, df.attrs.get("elo_final_ratings", {}))
     print(f"строк записано: {written} (всего вычислено: {len(df)})")
     return 0
 
