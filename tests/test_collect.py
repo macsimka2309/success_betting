@@ -206,6 +206,72 @@ def test_fixtures_update_does_not_duplicate(tmp_path, conn):
     assert client2.requests_used == 1  # реально сходил в API, не взял из кэша
 
 
+# ------------------------------------------- международные турниры (docs/06, этап 9)
+
+
+def test_international_fixtures_ignores_active_window(tmp_path, conn, monkeypatch):
+    """В отличие от run_fixtures, не ограничивается активным окном сезона —
+    нужные турниры (например, ЧМ-2022) давно завершились к моменту сбора."""
+    monkeypatch.setattr(collect, "INTERNATIONAL_LEAGUE_IDS", (777,))
+    monkeypatch.setattr(collect, "INTERNATIONAL_LEAGUE_SEASONS", {777: (2020,)})
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (777, 'Test Cup', true)")
+    item = fixture_response_item()
+    item["league"] = {"id": 777, "season": 2020, "round": "Final"}
+    client = make_client(tmp_path, [{"response": [item]}])
+
+    ctx = collect.run_international_fixtures(client, conn)
+
+    assert ctx.items_processed == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM fixtures WHERE fixture_id = 1001")
+        assert cur.fetchone()[0] == 1
+
+
+def test_international_backfill_does_not_touch_other_leagues(tmp_path, conn, monkeypatch):
+    """Бюджет international-backfill расходуется только на наши 10 турниров,
+    не расползается на обычную клубную дозагрузку (у неё свой бюджет, ФТ-11)."""
+    monkeypatch.setattr(collect, "INTERNATIONAL_LEAGUE_IDS", (777,))
+    now_utc = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        # обычная клубная лига — не должна быть тронута
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (39, 'Premier League', true)")
+        cur.execute(
+            "INSERT INTO league_seasons (league_id, season, has_events, has_statistics, has_lineups) "
+            "VALUES (39, 2025, true, true, true)"
+        )
+        cur.execute("INSERT INTO teams (team_id, name) VALUES (36, 'Fulham'), (34, 'Newcastle')")
+        cur.execute(
+            """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
+               status_short, home_team_id, away_team_id) VALUES (2001, 39, 2025, %s, %s, 'FT', 36, 34)""",
+            (now_utc, now_utc.date()),
+        )
+        # международный турнир — должен быть обработан
+        cur.execute("INSERT INTO leagues (league_id, name, is_tracked) VALUES (777, 'Test Cup', true)")
+        cur.execute(
+            "INSERT INTO league_seasons (league_id, season, has_events, has_statistics, has_lineups) "
+            "VALUES (777, 2020, true, true, true)"
+        )
+        cur.execute(
+            """INSERT INTO fixtures (fixture_id, league_id, season, kickoff_at, match_date,
+               status_short, home_team_id, away_team_id) VALUES (3001, 777, 2020, %s, %s, 'FT', 36, 34)""",
+            (now_utc, now_utc.date()),
+        )
+
+    # По одному пустому ответу на каждый из 3 видов (events/statistics/lineups) —
+    # всего один ожидаемый матч (3001), клубный (2001) запрашиваться не должен.
+    client = make_client(tmp_path, [{"response": []}, {"response": []}, {"response": []}])
+
+    collect.run_international_backfill(client, conn)
+
+    assert client.requests_used == 3
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM fixture_fetch_state WHERE fixture_id = 3001")
+        assert cur.fetchone()[0] == 1  # международный матч обработан
+        cur.execute("SELECT count(*) FROM fixture_fetch_state WHERE fixture_id = 2001")
+        assert cur.fetchone()[0] == 0  # клубный матч не тронут
+
+
 # ------------------------------------------------- охват лиг и активные сезоны
 
 

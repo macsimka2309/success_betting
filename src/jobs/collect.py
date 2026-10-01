@@ -164,11 +164,15 @@ def _pending_fixtures(
     limit: int,
     min_date: date | None = None,
     max_date: date | None = None,
+    league_ids: tuple[int, ...] | None = None,
 ) -> list[int]:
     """Матчи, где данных ещё нет, а источник их отдаёт (ЕС-4, ЕС-5).
 
     `min_date` (включительно) и `max_date` (не включая) ограничивают дату матча:
-    так ежедневный сбор берёт свежие, а дозагрузка — более старые.
+    так ежедневный сбор берёт свежие, а дозагрузка — более старые. `league_ids`
+    сужает набор до конкретных лиг — нужно `run_international_backfill`, чтобы
+    не расходовать её отдельный бюджет на обычную клубную дозагрузку (ФТ-11),
+    у которой и так свой путь (docs/06, этап 9).
     """
     fetched_column = _FETCHED_COLUMN[field_name]
     attempt_column = _ATTEMPT_COLUMN[field_name]
@@ -180,6 +184,10 @@ def _pending_fixtures(
     if max_date is not None:
         date_filter += " AND f.match_date < %s"
         params.append(max_date)
+    league_filter = ""
+    if league_ids is not None:
+        league_filter = " AND f.league_id = ANY(%s)"
+        params.append(list(league_ids))
     params.append(limit)
     sql = f"""
         SELECT f.fixture_id
@@ -191,7 +199,7 @@ def _pending_fixtures(
           AND COALESCE(ls.{coverage_column}, true)
           AND (s.fixture_id IS NULL OR (
                 s.{fetched_column} IS NULL AND COALESCE(s.{attempt_column}, 0) < %s
-          )){date_filter}
+          )){date_filter}{league_filter}
         ORDER BY f.match_date DESC, f.fixture_id
         LIMIT %s
     """
@@ -913,6 +921,97 @@ def print_backfill_report(conn, since: date, fresh_days: int, avg_leftover: int 
     return report
 
 
+# --------------------------------------- международные турниры (docs/06, этап 9)
+
+# 10 турниров сверх обычных 782 клубных лиг (`is_tracked`, перенесены из
+# legacy-проекта): самые популярные у букмекеров — ЧМ, Евро, Лига чемпионов
+# УЕФА, отборы ЧМ по всем конфедерациям. Решение и объём (2 241 матч по этим
+# парам лига-сезон, ~6700 запросов на статистику/события/составы) — 01.10.2026,
+# см. docs/06. Список и сезоны зашиты явно (не через каталог): это узкая,
+# осознанно ограниченная выборка, а не общее правило для всех 460 Cup-турниров.
+INTERNATIONAL_LEAGUE_IDS = (1, 4, 2, 29, 30, 31, 32, 33, 34, 37)
+INTERNATIONAL_LEAGUE_SEASONS: dict[int, tuple[int, ...]] = {
+    1: (2022, 2026),        # Чемпионат мира
+    4: (2020, 2024),        # Чемпионат Европы
+    2: (2024, 2025, 2026),  # Лига чемпионов УЕФА
+    29: (2023,),            # Отбор ЧМ — Африка
+    30: (2026,),            # Отбор ЧМ — Азия
+    31: (2026,),            # Отбор ЧМ — КОНКАКАФ
+    32: (2024,),            # Отбор ЧМ — Европа
+    33: (2026,),            # Отбор ЧМ — Океания
+    34: (2026,),            # Отбор ЧМ — Южная Америка
+    37: (2026,),            # Отбор ЧМ — межконтинентальные плей-офф
+}
+
+
+def run_international_fixtures(client: ApiClient, conn) -> StepContext:
+    """Разовая загрузка списка матчей по международным турнирам (см. выше).
+
+    Только список матчей (дёшево — по одному запросу на пару лига-сезон,
+    14 запросов всего), без статистики/событий/составов — их дотягивает
+    `run_international_backfill` отдельным бюджетом. В отличие от
+    `run_fixtures`, не ограничивается «активным» окном сезона: нужные нам
+    сезоны (2020–2024) давно завершились, а `_target_league_seasons`
+    такие бы отфильтровала.
+    """
+    with collection_run(conn, client, "international_fixtures") as ctx:
+        for league_id in INTERNATIONAL_LEAGUE_IDS:
+            for season in INTERNATIONAL_LEAGUE_SEASONS[league_id]:
+                if client.quota_exhausted or client.requests_used >= client.max_requests:
+                    break
+                body = client.get("/fixtures", {"league": league_id, "season": season}, use_cache=False)
+                if body is None or body.get("errors"):
+                    continue
+                for item in body.get("response") or []:
+                    parsed = _parse_fixture_item(item, league_id, season)
+                    if parsed is None:
+                        ctx.skipped += 1
+                        continue
+                    _upsert_team(conn, parsed["home_team_id"], parsed["home_team_name"])
+                    _upsert_team(conn, parsed["away_team_id"], parsed["away_team_name"])
+                    write_row(
+                        conn, "fixtures", list(FIXTURE_COLUMNS),
+                        tuple(parsed[c] for c in FIXTURE_COLUMNS), "fixture_id",
+                    )
+                    ctx.items_processed += 1
+    return ctx
+
+
+def run_international_backfill(client: ApiClient, conn, chunk: int = BACKFILL_CHUNK) -> StepContext:
+    """Статистика/события/составы для международных турниров (docs/06, этап 9).
+
+    Та же механика «раунды по chunk, доля простаивающего набора — другим»,
+    что у `run_backfill`, но через `league_ids` в `_pending_fixtures`
+    ограничена только нашими 10 турнирами — чтобы выделенный под это
+    отдельный бюджет (временный cron, см. deploy/) не тратился на обычную
+    клубную дозагрузку (ФТ-11), у которой свой путь и свой бюджет.
+    """
+    done = dict.fromkeys(KINDS, 0)
+    with collection_run(conn, client, "international_backfill") as ctx:
+        active = list(KINDS)
+        while active and _budget_left(client):
+            for kind in list(active):
+                ids = _pending_fixtures(
+                    conn, kind, _COVERAGE[kind], chunk, league_ids=INTERNATIONAL_LEAGUE_IDS
+                )
+                if not ids:
+                    active.remove(kind)
+                    continue
+                try:
+                    for fixture_id in ids:
+                        if _PROCESSORS[kind](client, conn, fixture_id):
+                            done[kind] += 1
+                            ctx.items_processed += 1
+                except Stop:
+                    active.clear()
+                    break
+    print(
+        f"межд. турниры — события {done['events']}, статистика {done['statistics']}, "
+        f"составы {done['lineups']}"
+    )
+    return ctx
+
+
 # ------------------------------------------------ разовая дозагрузка ft90 (ДП-0)
 
 
@@ -996,6 +1095,8 @@ def run_daily(
 
 JOBS = {
     "ft90-backfill": lambda client, conn, args: run_ft90_backfill(client, conn),
+    "international-fixtures": lambda client, conn, args: run_international_fixtures(client, conn),
+    "international-backfill": lambda client, conn, args: run_international_backfill(client, conn),
     "catalog": lambda client, conn, args: run_catalog(client, conn),
     "fixtures": lambda client, conn, args: run_fixtures(client, conn),
     "injuries": lambda client, conn, args: run_injuries(client, conn),
