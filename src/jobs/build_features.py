@@ -351,6 +351,7 @@ def _shifted_rolling_batch(
     window: int | None,
     order_key: pd.Series,
     min_periods: int = 1,
+    shift: bool = True,
 ):
     """Как `_shifted_rolling`, но для нескольких колонок сразу за один проход.
 
@@ -360,6 +361,9 @@ def _shifted_rolling_batch(
     выровненный по меткам исходного индекса `df` (`reindex`, не позиционно).
 
     `window=None` — накопительно (`expanding`), иначе — последние `window`.
+    `shift=False` — без исключения текущей строки (используется только
+    `_asof_role_rolling`, где исключение делает сам `merge_asof`, см. его
+    докстринг — двойной сдвиг дал бы на одну строку меньше, чем нужно).
     Возвращает (DataFrame средних по каждой колонке, Series числа учтённых
     матчей — одна на все колонки: у них общая группа наблюдений).
     """
@@ -367,8 +371,8 @@ def _shifted_rolling_batch(
     sub = df.loc[order, value_cols]
     g = groups.loc[order]
 
-    shifted = sub.groupby(g)[value_cols].shift(1)
-    grouped = shifted.groupby(g)
+    base = sub.groupby(g)[value_cols].shift(1) if shift else sub
+    grouped = base.groupby(g)
     if window is None:
         means = grouped.transform(lambda x: x.expanding(min_periods=min_periods).mean())
         counted = grouped[value_cols[0]].transform(lambda x: x.expanding(min_periods=0).count())
@@ -376,6 +380,60 @@ def _shifted_rolling_batch(
         means = grouped.transform(lambda x: x.rolling(window, min_periods=min_periods).mean())
         counted = grouped[value_cols[0]].transform(lambda x: x.rolling(window, min_periods=0).count())
     return means.reindex(df.index), counted.reindex(df.index)
+
+
+def _asof_role_rolling(
+    work: pd.DataFrame,
+    value_cols: list[str],
+    role_idx: pd.Index,
+    window: int | None,
+):
+    """Форма команды в роли (дома/в гостях), протянутая на ЛЮБОЙ её матч.
+
+    Баг, найденный чатом «Модели» 02.10.2026: прежняя версия считала
+    `scope="home"`/`"away"` только на строках той же роли и писала
+    результат туда же — так `home_team_away_*` (форма хозяев матча в их
+    СОБСТВЕННЫХ гостевых играх) никогда не пересекалась с какой-либо
+    строкой при развороте в широкий формат (`_pivot_side_features` берёт
+    `home_team_*` только со строк, где команда — хозяин) и оставалась
+    `NULL` по всей базе (984 784/984 784). Та же причина ломала
+    `away_team_home_*` и — независимо найдено при проверке этого фикса —
+    идентичные колонки `stats__*` (ДП-4, `compute_statistics_features`).
+
+    Правильно: «форма команды дома» — это свойство команды на момент
+    времени, которое нужно знать и для её гостевых матчей тоже, а не
+    только для следующего домашнего. Считаем включительно (`shift=False`)
+    только по подвыборке нужной роли (`role_idx`), затем для ЛЮБОГО матча
+    команды в сезоне (включая саму эту подвыборку) берём `merge_asof`
+    назад по времени с `allow_exact_matches=False` — это одновременно:
+    даёт команде её текущий матч той же роли ровно то же число, что раньше
+    давал `shift(1)` (ближайшая предыдущая запись исключает саму строку),
+    и правильно протягивает то же число на любой более поздний матч
+    другой роли вплоть до следующего матча исходной роли.
+    """
+    sub_key = work.loc[role_idx, "team_season_key"]
+    order_key = work.loc[role_idx, "kickoff_at"]
+    means_incl, counted_incl = _shifted_rolling_batch(
+        work.loc[role_idx], value_cols, sub_key, window, order_key, shift=False
+    )
+    timeline = means_incl.copy()
+    timeline["matches_played"] = counted_incl
+    # Без `.values`: он сбрасывает таймзону у `kickoff_at` (tz-aware -> naive),
+    # из-за чего `merge_asof` ниже падает на несовпадении dtype с `query`.
+    # Индексы здесь совпадают (оба — `role_idx`), поэтому выравнивание по
+    # индексу безопасно и сохраняет исходный dtype.
+    timeline["team_season_key"] = sub_key
+    timeline["kickoff_at"] = order_key
+    timeline = timeline.sort_values("kickoff_at")
+
+    query = work[["team_season_key", "kickoff_at"]].sort_values("kickoff_at")
+    merged = pd.merge_asof(
+        query, timeline, on="kickoff_at", by="team_season_key",
+        direction="backward", allow_exact_matches=False,
+    )
+    merged.index = query.index
+    merged = merged.reindex(work.index)
+    return merged[value_cols], merged["matches_played"]
 
 
 def compute_league_lines(fx: pd.DataFrame) -> pd.DataFrame:
@@ -537,19 +595,27 @@ def compute_form(long_df: pd.DataFrame) -> pd.DataFrame:
         work[source_col] = work[source_col].astype(float)
     source_cols = list(_FORM_METRIC_SOURCE_COLUMNS.values())
 
-    scopes = {
-        "overall": work.index,
-        "home": work.index[work["is_home"]],
-        "away": work.index[~work["is_home"]],
-    }
-    for scope, idx in scopes.items():
-        sub_key = work.loc[idx, "team_season_key"]
-        order_key = work.loc[idx, "kickoff_at"]
+    # scope="overall" — на всех строках команды, скользящее обычным образом.
+    # scope="home"/"away" — форма КОМАНДЫ в этой роли, нужна для ЛЮБОГО её
+    # матча (не только следующего той же роли), поэтому — через
+    # `_asof_role_rolling`, а не прямой фильтр по текущей строке (см. его
+    # докстринг про найденный 02.10.2026 баг).
+    idx = work.index
+    sub_key = work.loc[idx, "team_season_key"]
+    order_key = work.loc[idx, "kickoff_at"]
+    for window_name, window in (("short", SHORT_WINDOW), ("long", LONG_WINDOW)):
+        means, counted = _shifted_rolling_batch(work.loc[idx], source_cols, sub_key, window, order_key)
+        out[f"form__overall__{window_name}__matches_played"] = counted.values
+        for metric, source_col in _FORM_METRIC_SOURCE_COLUMNS.items():
+            out[f"form__overall__{window_name}__{metric}"] = means[source_col].values
+
+    role_idx = {"home": work.index[work["is_home"]], "away": work.index[~work["is_home"]]}
+    for scope, r_idx in role_idx.items():
         for window_name, window in (("short", SHORT_WINDOW), ("long", LONG_WINDOW)):
-            means, counted = _shifted_rolling_batch(work.loc[idx], source_cols, sub_key, window, order_key)
-            out.loc[idx, f"form__{scope}__{window_name}__matches_played"] = counted.values
+            means, counted = _asof_role_rolling(work, source_cols, r_idx, window)
+            out[f"form__{scope}__{window_name}__matches_played"] = counted.values
             for metric, source_col in _FORM_METRIC_SOURCE_COLUMNS.items():
-                out.loc[idx, f"form__{scope}__{window_name}__{metric}"] = means[source_col].values
+                out[f"form__{scope}__{window_name}__{metric}"] = means[source_col].values
     return out
 
 
@@ -578,20 +644,28 @@ def compute_statistics_features(long_df: pd.DataFrame, stats: pd.DataFrame) -> p
     source_cols = ["has_stats"] + [
         f"{metric}{suffix}" for metric in STAT_METRICS for suffix in ("", "_against")
     ]
-    scopes = {
-        "overall": merged.index,
-        "home": merged.index[merged["is_home"]],
-        "away": merged.index[~merged["is_home"]],
-    }
-    for scope, idx in scopes.items():
-        sub_key = merged.loc[idx, "team_season_key"]
-        order_key = merged.loc[idx, "kickoff_at"]
+    # Как в compute_form (ДП-3): scope="overall" — прямой скользящий расчёт,
+    # scope="home"/"away" — форма КОМАНДЫ в этой роли, протянутая на любой
+    # её матч через `_asof_role_rolling` (см. его докстринг про баг,
+    # найденный 02.10.2026 и идентично поражавший эти же колонки здесь).
+    idx = merged.index
+    sub_key = merged.loc[idx, "team_season_key"]
+    order_key = merged.loc[idx, "kickoff_at"]
+    for window_name, window in (("short", SHORT_WINDOW), ("long", LONG_WINDOW)):
+        means, _ = _shifted_rolling_batch(merged.loc[idx], source_cols, sub_key, window, order_key)
+        out[f"stats__overall__{window_name}__stats_coverage"] = means["has_stats"].values
+        for metric in STAT_METRICS:
+            for direction, col in (("for", metric), ("against", f"{metric}_against")):
+                out[f"stats__overall__{window_name}__{metric}_{direction}_avg"] = means[col].values
+
+    role_idx = {"home": merged.index[merged["is_home"]], "away": merged.index[~merged["is_home"]]}
+    for scope, r_idx in role_idx.items():
         for window_name, window in (("short", SHORT_WINDOW), ("long", LONG_WINDOW)):
-            means, _ = _shifted_rolling_batch(merged.loc[idx], source_cols, sub_key, window, order_key)
-            out.loc[idx, f"stats__{scope}__{window_name}__stats_coverage"] = means["has_stats"].values
+            means, _ = _asof_role_rolling(merged, source_cols, r_idx, window)
+            out[f"stats__{scope}__{window_name}__stats_coverage"] = means["has_stats"].values
             for metric in STAT_METRICS:
                 for direction, col in (("for", metric), ("against", f"{metric}_against")):
-                    out.loc[idx, f"stats__{scope}__{window_name}__{metric}_{direction}_avg"] = means[col].values
+                    out[f"stats__{scope}__{window_name}__{metric}_{direction}_avg"] = means[col].values
     return out
 
 

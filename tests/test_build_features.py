@@ -228,6 +228,69 @@ def test_form_no_min_window_gate_uses_available_matches():
     assert second["form__overall__short__goals_scored_avg"] == 2.0
 
 
+def test_form_role_specific_scope_is_not_null_for_opposite_role_match():
+    """Найдено чатом «Модели» 02.10.2026: form__away__* считался только на
+    строках, где команда играет в гостях, и писался туда же — после пивота
+    в home_team_away_* (который как раз берётся со строки, где команда
+    ДОМА) это давало NULL на все 984 784 строки продовой базы. Команда 10:
+    играет дома (матч 1), дома (матч 2), в гостях (матч 3), снова дома
+    (матч 4) — перед матчем 4 её форма «в гостях» должна быть видна и
+    непуста, посчитана по единственному гостевому матчу (3)."""
+    rows = [
+        {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 20, "kickoff_at": ts(1), "goals_home": 2, "goals_away": 0},
+        {"fixture_id": 2, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 30, "kickoff_at": ts(8), "goals_home": 1, "goals_away": 1},
+        {"fixture_id": 3, "league_id": 1, "season": 2026, "home_team_id": 40,
+         "away_team_id": 10, "kickoff_at": ts(15), "goals_home": 0, "goals_away": 3},
+        {"fixture_id": 4, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 50, "kickoff_at": ts(22), "goals_home": 2, "goals_away": 2},
+    ]
+    df = bf.compute_targets(make_fixtures_df(rows))
+    long_df = bf._team_long_format(df)
+    form = bf.compute_form(long_df)
+
+    before_match4 = form[(form["fixture_id"] == 4) & (form["team_id"] == 10)].iloc[0]
+    assert before_match4["form__away__short__matches_played"] == 1
+    assert before_match4["form__away__short__goals_scored_avg"] == 3.0  # забила 3 в матче 3
+
+    # Контроль — своя роль (дом) перед матчем 2 не сломана тем же изменением.
+    before_match2 = form[(form["fixture_id"] == 2) & (form["team_id"] == 10)].iloc[0]
+    assert before_match2["form__home__short__matches_played"] == 1
+    assert before_match2["form__home__short__goals_scored_avg"] == 2.0  # матч 1
+
+    # Самый первый матч вообще — ни домашней, ни гостевой истории ещё нет.
+    before_match1 = form[(form["fixture_id"] == 1) & (form["team_id"] == 10)].iloc[0]
+    assert pd.isna(before_match1["form__home__short__matches_played"])
+    assert pd.isna(before_match1["form__away__short__matches_played"])
+
+
+def test_statistics_role_specific_scope_is_not_null_for_opposite_role_match():
+    """Тот же баг и то же исправление, что для формы (ДП-3) — независимо
+    поражал compute_statistics_features (ДП-4): идентичный scope-фильтр."""
+    rows = [
+        {"fixture_id": 1, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 20, "kickoff_at": ts(1), "goals_home": 2, "goals_away": 0},
+        {"fixture_id": 3, "league_id": 1, "season": 2026, "home_team_id": 40,
+         "away_team_id": 10, "kickoff_at": ts(15), "goals_home": 0, "goals_away": 3},
+        {"fixture_id": 4, "league_id": 1, "season": 2026, "home_team_id": 10,
+         "away_team_id": 50, "kickoff_at": ts(22), "goals_home": 2, "goals_away": 2},
+    ]
+    df = bf.compute_targets(make_fixtures_df(rows))
+    long_df = bf._team_long_format(df)
+    stats_raw = pd.DataFrame(
+        [{"fixture_id": 1, "team_id": 10, "shots_on_goal": 5, "total_shots": 10,
+          "corner_kicks": 3, "ball_possession": 55.0, "expected_goals": 1.2},
+         {"fixture_id": 3, "team_id": 10, "shots_on_goal": 2, "total_shots": 6,
+          "corner_kicks": 1, "ball_possession": 40.0, "expected_goals": 0.5}]
+    )
+    stats = bf.compute_statistics_features(long_df, stats_raw)
+
+    before_match4 = stats[(stats["fixture_id"] == 4) & (stats["team_id"] == 10)].iloc[0]
+    assert before_match4["stats__away__short__stats_coverage"] == 1.0
+    assert before_match4["stats__away__short__shots_on_goal_for_avg"] == 2.0
+
+
 # --------------------------------------------------------------------- h2h
 
 
