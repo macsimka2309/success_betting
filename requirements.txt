@@ -6,5 +6,10 @@ pandas==2.2.3
 pyarrow==17.0.0
 numpy==2.5.3
 
+# Обучение модели (этап 10, specs/модель-предсказаний.md)
+lightgbm==4.7.0
+scikit-learn==1.9.1
+joblib==1.6.0
+
 # Тесты
 pytest==8.3.3
