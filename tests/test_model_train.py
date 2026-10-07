@@ -154,3 +154,14 @@ def test_train_league_total_excludes_rows_with_null_target(splits, tmp_path):
     assert result["naive"]["n"] == non_null_test_count
     assert result["lightgbm"]["n"] == non_null_test_count
     assert result["logreg"]["n"] == non_null_test_count - 1  # ещё минус строка со спец. пропуском в LR-признаке
+
+
+def test_training_sql_default_has_no_stats_filter():
+    sql = mt.training_sql(full_stats_only=False)
+    assert sql.endswith("WHERE reg_home IS NOT NULL")
+
+
+def test_training_sql_full_stats_only_requires_both_teams_full_coverage():
+    sql = mt.training_sql(full_stats_only=True)
+    assert "home_team_overall_short_stats_coverage = 1" in sql
+    assert "away_team_overall_short_stats_coverage = 1" in sql

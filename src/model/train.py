@@ -57,10 +57,22 @@ DEFAULT_GBM_PARAMS: dict[str, Any] = {
 DEFAULT_EARLY_STOPPING_ROUNDS = 50
 
 
-def load_training_rows(conn: psycopg.Connection) -> pd.DataFrame:
-    """Сыгранные матчи (`reg_home IS NOT NULL`) с целями и признаками."""
+def training_sql(full_stats_only: bool = False) -> str:
+    """`full_stats_only` — только матчи, где у обеих команд полная статистика
+    за короткое окно (coverage = 1): самый полный набор данных для модели."""
     columns = list(dict.fromkeys(["match_date"] + list(TARGET_COLUMNS.values()) + list(FEATURE_COLUMNS)))
-    sql = f"SELECT {', '.join(columns)} FROM ml_match_features WHERE reg_home IS NOT NULL"
+    where = "reg_home IS NOT NULL"
+    if full_stats_only:
+        where += (
+            " AND home_team_overall_short_stats_coverage = 1"
+            " AND away_team_overall_short_stats_coverage = 1"
+        )
+    return f"SELECT {', '.join(columns)} FROM ml_match_features WHERE {where}"
+
+
+def load_training_rows(conn: psycopg.Connection, full_stats_only: bool = False) -> pd.DataFrame:
+    """Сыгранные матчи (`reg_home IS NOT NULL`) с целями и признаками."""
+    sql = training_sql(full_stats_only)
     with conn.cursor() as cur:
         cur.execute(sql)
         cols = [d.name for d in cur.description]
@@ -200,11 +212,16 @@ def train_league_total(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models-dir", default="models")
+    parser.add_argument(
+        "--full-stats-only",
+        action="store_true",
+        help="обучать только на матчах с полной статистикой обеих команд (coverage = 1)",
+    )
     args = parser.parse_args()
 
     url = database_url()
     with connect(url) as conn:
-        df = load_training_rows(conn)
+        df = load_training_rows(conn, full_stats_only=args.full_stats_only)
     df = coerce_feature_columns(df)
     splits = time_split(df)
 
