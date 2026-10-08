@@ -37,7 +37,10 @@ def _predictions(line=2.5):
 
 
 def _odds(rows):
-    return pd.DataFrame(rows, columns=["fixture_id", "bet_type", "value", "odd"])
+    """Строки `(fixture_id, bet_type, value, odd[, bookmaker])` — букмекер
+    по умолчанию Pinnacle, если не указан явно."""
+    normalized = [r if len(r) == 5 else (*r, "Pinnacle") for r in rows]
+    return pd.DataFrame(normalized, columns=mp.ODDS_COLUMNS)
 
 
 def test_predict_maps_classes_and_totals_to_outcome_columns():
@@ -101,6 +104,37 @@ def test_total_skipped_when_match_has_no_line():
     odds = _odds([(1, "Goals Over/Under", "Over 2.5", 2.0)])
     bets = mp.build_bets(_predictions(line=None), odds)
     assert bets.empty
+
+
+def test_prefer_bookmaker_keeps_pinnacle_over_1xbet():
+    odds = _odds([
+        (1, "Match Winner", "Home", 2.0, "Pinnacle"),
+        (1, "Match Winner", "Home", 2.2, "1xBet"),
+    ])
+    out = mp.prefer_bookmaker(odds)
+    assert len(out) == 1
+    assert out.loc[0, "bookmaker"] == "Pinnacle"
+    assert out.loc[0, "odd"] == 2.0
+
+
+def test_prefer_bookmaker_falls_back_to_1xbet_when_pinnacle_missing():
+    odds = _odds([(1, "Match Winner", "Home", 2.2, "1xBet")])
+    out = mp.prefer_bookmaker(odds)
+    assert len(out) == 1
+    assert out.loc[0, "bookmaker"] == "1xBet"
+    assert out.loc[0, "odd"] == 2.2
+
+
+def test_prefer_bookmaker_drops_unknown_bookmakers():
+    odds = _odds([(1, "Match Winner", "Home", 3.0, "Marathonbet")])
+    out = mp.prefer_bookmaker(odds)
+    assert out.empty
+
+
+def test_bets_carry_bookmaker_column():
+    odds = _odds([(1, "Match Winner", "Home", 2.0, "1xBet")])
+    bets = mp.build_bets(_predictions(), odds)
+    assert bets.loc[0, "bookmaker"] == "1xBet"
 
 
 def test_bets_sorted_by_ev_descending():

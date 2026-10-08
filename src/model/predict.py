@@ -1,10 +1,13 @@
-"""Прогноз исходов будущих матчей и отбор ставок по коэффициентам Pinnacle.
+"""Прогноз исходов будущих матчей и отбор ставок по коэффициентам.
 
 Спецификация: specs/модель-предсказаний.md, «Инференс и отбор ставок».
 
 Модели — LightGBM из `models/full_stats/` (обучены на полной статистике).
-Коэффициенты — последний снимок Pinnacle; тотал сверяется только по точной
-линии `league_total_line`. Результат — Parquet в `models/bets/`, в Git не попадает.
+Коэффициенты — последний снимок Pinnacle; если по конкретному исходу у
+Pinnacle снимка нет, берётся 1xBet (помечается колонкой `bookmaker` — это
+менее точный букмекер, см. decision log в спецификации). Тотал сверяется
+только по точной линии `league_total_line`. Результат — Parquet в
+`models/bets/`, в Git не попадает.
 
 Использование:
     python3 -m src.model.predict [--models-dir models/full_stats] [--out-dir models/bets]
@@ -27,7 +30,11 @@ from src.model.train import coerce_feature_columns
 
 ODDS_MIN = 1.5
 ODDS_MAX = 2.5
-BOOKMAKER = "Pinnacle"
+# Порядок — приоритет: Pinnacle точнее 1xBet, берём его первым и используем
+# 1xBet только как откат для исходов без снимка Pinnacle (08.10.2026 решение
+# владельца: без этого слишком много матчей выпадало из-за отсутствия
+# Pinnacle, хотя 1xBet котировка была).
+BOOKMAKERS_BY_PRIORITY = ("Pinnacle", "1xBet")
 LINE_PATTERN = re.compile(r"^(Over|Under) ([+-]?\d+(?:\.\d+)?)$")
 
 RESULT_CLASSES = ("A", "D", "H")  # порядок колонок predict_proba LightGBM (sorted)
@@ -58,27 +65,47 @@ def load_upcoming_features(conn: psycopg.Connection) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
-def load_pinnacle_odds(conn: psycopg.Connection, fixture_ids: list[int]) -> pd.DataFrame:
-    """Последний снимок Pinnacle по каждому (матч, рынок, исход)."""
+ODDS_COLUMNS = ["fixture_id", "bet_type", "value", "odd", "bookmaker"]
+
+
+def prefer_bookmaker(df: pd.DataFrame, priority: tuple[str, ...] = BOOKMAKERS_BY_PRIORITY) -> pd.DataFrame:
+    """Из нескольких строк на один (fixture_id, bet_type, value) — от разных
+    букмекеров — оставляет одну, по приоритету `priority` (первый найденный
+    выигрывает). Букмекеры вне `priority` отбрасываются."""
+    if df.empty:
+        return pd.DataFrame(columns=ODDS_COLUMNS)
+    rank = {name: i for i, name in enumerate(priority)}
+    df = df[df["bookmaker"].isin(rank)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=ODDS_COLUMNS)
+    df["_priority"] = df["bookmaker"].map(rank)
+    df = df.sort_values("_priority").drop_duplicates(subset=["fixture_id", "bet_type", "value"], keep="first")
+    return df[ODDS_COLUMNS].reset_index(drop=True)
+
+
+def load_odds(conn: psycopg.Connection, fixture_ids: list[int]) -> pd.DataFrame:
+    """Последний снимок по каждому (матч, рынок, исход): Pinnacle, а если у
+    Pinnacle снимка нет — откат на 1xBet (колонка `bookmaker` показывает,
+    какой источник использован; см. `prefer_bookmaker`)."""
     if not fixture_ids:
-        return pd.DataFrame(columns=["fixture_id", "bet_type", "value", "odd"])
+        return pd.DataFrame(columns=ODDS_COLUMNS)
     sql = """
-        SELECT DISTINCT ON (s.fixture_id, bt.name, v.value)
-               s.fixture_id, bt.name AS bet_type, v.value, v.odd
+        SELECT DISTINCT ON (s.fixture_id, bt.name, v.value, b.name)
+               s.fixture_id, bt.name AS bet_type, v.value, v.odd, b.name AS bookmaker
         FROM odds_values v
         JOIN odds_snapshots s ON s.snapshot_id = v.snapshot_id
         JOIN bookmakers b ON b.bookmaker_id = v.bookmaker_id
         JOIN bet_types bt ON bt.bet_type_id = v.bet_type_id
-        WHERE b.name = %s
+        WHERE b.name = ANY(%s)
           AND bt.name IN ('Match Winner', 'Goals Over/Under')
           AND s.fixture_id = ANY(%s)
-        ORDER BY s.fixture_id, bt.name, v.value, s.taken_at DESC
+        ORDER BY s.fixture_id, bt.name, v.value, b.name, s.taken_at DESC
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (BOOKMAKER, fixture_ids))
+        cur.execute(sql, (list(BOOKMAKERS_BY_PRIORITY), fixture_ids))
         cols = [d.name for d in cur.description]
         rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
+    return prefer_bookmaker(pd.DataFrame(rows, columns=cols))
 
 
 def predict_predictions(
@@ -110,7 +137,8 @@ def _parse_line(value: str) -> tuple[str, float] | None:
 
 
 def build_bets(predictions: pd.DataFrame, odds: pd.DataFrame) -> pd.DataFrame:
-    """Исходы с коэффициентом Pinnacle в [ODDS_MIN; ODDS_MAX] и EV = p × кф − 1."""
+    """Исходы с коэффициентом (Pinnacle, либо 1xBet в откате) в
+    [ODDS_MIN; ODDS_MAX] и EV = p × кф − 1."""
     lines = predictions.set_index("fixture_id")["league_total_line"].to_dict()
     probs = predictions.set_index("fixture_id")
     rows = []
@@ -149,12 +177,13 @@ def build_bets(predictions: pd.DataFrame, odds: pd.DataFrame) -> pd.DataFrame:
                 "outcome": outcome,
                 "model_prob": float(side_prob),
                 "odds": odd,
+                "bookmaker": odd_row.bookmaker,
                 "ev": float(side_prob) * odd - 1.0,
             }
         )
     columns = [
         "fixture_id", "match_date", "home_team", "away_team", "kickoff_at", "status_short",
-        "market", "outcome", "model_prob", "odds", "ev",
+        "market", "outcome", "model_prob", "odds", "bookmaker", "ev",
     ]
     return pd.DataFrame(rows, columns=columns).sort_values("ev", ascending=False).reset_index(drop=True)
 
@@ -171,7 +200,7 @@ def main() -> int:
 
     with connect(database_url()) as conn:
         features = load_upcoming_features(conn)
-        odds = load_pinnacle_odds(conn, features["fixture_id"].tolist())
+        odds = load_odds(conn, features["fixture_id"].tolist())
 
     predictions = predict_predictions(features, result_model, total_model)
     bets = build_bets(predictions, odds)
