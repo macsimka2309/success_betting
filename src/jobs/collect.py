@@ -128,11 +128,13 @@ _ATTEMPT_COLUMN = {
     "events": "events_attempts",
     "statistics": "statistics_attempts",
     "lineups": "lineups_attempts",
+    "halves": "halves_attempts",
 }
 _FETCHED_COLUMN = {
     "events": "events_fetched_at",
     "statistics": "statistics_fetched_at",
     "lineups": "lineups_fetched_at",
+    "halves": "halves_fetched_at",
 }
 
 
@@ -177,6 +179,15 @@ def _pending_fixtures(
     fetched_column = _FETCHED_COLUMN[field_name]
     attempt_column = _ATTEMPT_COLUMN[field_name]
     params: list = [list(FINISHED_STATUSES), MAX_ATTEMPTS]
+    if field_name == "halves":
+        # Таймы добираются только там, где итоговая статистика уже есть
+        # (specs/статистика-по-таймам.md, ПТ-4); отсутствие строки состояния — норма.
+        need_filter = f"""EXISTS (SELECT 1 FROM fixture_statistics fs WHERE fs.fixture_id = f.fixture_id)
+          AND s.{fetched_column} IS NULL AND COALESCE(s.{attempt_column}, 0) < %s"""
+    else:
+        need_filter = f"""(s.fixture_id IS NULL OR (
+                s.{fetched_column} IS NULL AND COALESCE(s.{attempt_column}, 0) < %s
+          ))"""
     date_filter = ""
     if min_date is not None:
         date_filter += " AND f.match_date >= %s"
@@ -197,9 +208,7 @@ def _pending_fixtures(
         LEFT JOIN fixture_fetch_state s ON s.fixture_id = f.fixture_id
         WHERE f.status_short = ANY(%s)
           AND COALESCE(ls.{coverage_column}, true)
-          AND (s.fixture_id IS NULL OR (
-                s.{fetched_column} IS NULL AND COALESCE(s.{attempt_column}, 0) < %s
-          )){date_filter}{league_filter}
+          AND {need_filter}{date_filter}{league_filter}
         ORDER BY f.match_date DESC, f.fixture_id
         LIMIT %s
     """
@@ -208,9 +217,11 @@ def _pending_fixtures(
         return [row[0] for row in cur.fetchall()]
 
 
-def _fetch_items(client: ApiClient, endpoint: str, fixture_id: int) -> list | None:
+def _fetch_items(
+    client: ApiClient, endpoint: str, fixture_id: int, extra: dict | None = None
+) -> list | None:
     """Возвращает список из `response`, None при неудаче, бросает Stop при бюджете."""
-    body = client.get(endpoint, {"fixture": fixture_id})
+    body = client.get(endpoint, {"fixture": fixture_id, **(extra or {})})
     if body is None:
         if client.quota_exhausted or client.requests_used >= client.max_requests:
             raise Stop()
@@ -630,9 +641,9 @@ def _process_events(client: ApiClient, conn, fixture_id: int) -> bool:
     return True
 
 
-def _parse_statistics_row(entry: dict) -> dict[str, int | float | None]:
+def _parse_statistics_row(entry: dict, block: str = "statistics") -> dict[str, int | float | None]:
     result: dict[str, int | float | None] = {}
-    for row in entry.get("statistics") or []:
+    for row in entry.get(block) or []:
         stat_type = row.get("type")
         value = row.get("value")
         if stat_type in STAT_TYPE_MAP:
@@ -649,8 +660,26 @@ STAT_COLUMNS = (
 )
 
 
+_HALF_BLOCKS = ((1, "statistics_1h"), (2, "statistics_2h"))
+
+
+def _write_halves(conn, fixture_id: int, team_id: int, entry: dict) -> None:
+    """Пишет блоки `statistics_1h/2h` одной команды. Пустой блок не пишется (ПТ-6)."""
+    for half, block in _HALF_BLOCKS:
+        values = _parse_statistics_row(entry, block)
+        if all(values.get(c) is None for c in STAT_COLUMNS):
+            continue
+        write_row(
+            conn, "fixture_statistics_halves",
+            ["fixture_id", "team_id", "half", *STAT_COLUMNS],
+            (fixture_id, team_id, half, *[values.get(c) for c in STAT_COLUMNS]),
+            "fixture_id, team_id, half",
+        )
+
+
 def _process_statistics(client: ApiClient, conn, fixture_id: int) -> bool:
-    items = _fetch_items(client, "/fixtures/statistics", fixture_id)
+    """Итог и таймы одним запросом (`half=true`, specs/статистика-по-таймам.md, ПТ-3)."""
+    items = _fetch_items(client, "/fixtures/statistics", fixture_id, {"half": "true"})
     if items is None:
         mark_attempt(conn, fixture_id, "statistics")
         return False
@@ -667,7 +696,29 @@ def _process_statistics(client: ApiClient, conn, fixture_id: int) -> bool:
             (fixture_id, team_id, *[values.get(c) for c in STAT_COLUMNS]),
             "fixture_id, team_id",
         )
+        _write_halves(conn, fixture_id, team_id, entry)
     mark_fetched(conn, fixture_id, "statistics")
+    mark_fetched(conn, fixture_id, "halves")
+    return True
+
+
+def _process_halves(client: ApiClient, conn, fixture_id: int) -> bool:
+    """Таймы для матча, у которого итоговая статистика уже есть (ПТ-4).
+
+    Итог в `fixture_statistics` не перезаписывается: пишутся только таймы.
+    """
+    items = _fetch_items(client, "/fixtures/statistics", fixture_id, {"half": "true"})
+    if items is None:
+        mark_attempt(conn, fixture_id, "halves")
+        return False
+    for entry in items:
+        team = entry.get("team") or {}
+        team_id = to_int(team.get("id"))
+        if team_id is None:
+            continue
+        _upsert_team(conn, team_id, team.get("name"))
+        _write_halves(conn, fixture_id, team_id, entry)
+    mark_fetched(conn, fixture_id, "halves")
     return True
 
 
@@ -768,7 +819,21 @@ def run_backfill(
     """
     upper = (today or _today()) - timedelta(days=fresh_days)
     done = dict.fromkeys(KINDS, 0)
+    halves_done = 0
     with collection_run(conn, client, "backfill") as ctx:
+        # Таймы старых матчей идут первыми, от новых к старым, пока очередь не
+        # опустеет: события и составы дозагрузки ждут (specs/статистика-по-таймам.md, ПТ-8).
+        while _budget_left(client):
+            ids = _pending_fixtures(conn, "halves", _COVERAGE["statistics"], chunk)
+            if not ids:
+                break
+            try:
+                for fixture_id in ids:
+                    if _process_halves(client, conn, fixture_id):
+                        halves_done += 1
+                        ctx.items_processed += 1
+            except Stop:
+                break
         active = list(KINDS)
         while active and _budget_left(client):
             for kind in list(active):
@@ -787,8 +852,8 @@ def run_backfill(
                     active.clear()  # бюджет кончился — остановка целиком (ДЗ-10)
                     break
     print(
-        f"дозагрузка: события {done['events']}, статистика {done['statistics']}, "
-        f"составы {done['lineups']}"
+        f"дозагрузка: таймы {halves_done}, события {done['events']}, "
+        f"статистика {done['statistics']}, составы {done['lineups']}"
     )
     return ctx
 
@@ -835,7 +900,21 @@ def backfill_report(
         cur.execute(sql, params)
         for grp, events, statistics, lineups in cur.fetchall():
             report[grp] = {"events": events, "statistics": statistics, "lineups": lineups}
-    remaining = sum(report["backfill"].values())
+    halves_sql = """
+        SELECT count(*)
+        FROM fixtures f
+        JOIN leagues l ON l.league_id = f.league_id AND l.is_tracked
+        LEFT JOIN league_seasons ls ON ls.league_id = f.league_id AND ls.season = f.season
+        LEFT JOIN fixture_fetch_state s ON s.fixture_id = f.fixture_id
+        WHERE f.status_short = ANY(%(finished)s)
+          AND COALESCE(ls.has_statistics, true)
+          AND EXISTS (SELECT 1 FROM fixture_statistics fs WHERE fs.fixture_id = f.fixture_id)
+          AND s.halves_fetched_at IS NULL AND COALESCE(s.halves_attempts, 0) < %(max)s
+    """
+    with conn.cursor() as cur:
+        cur.execute(halves_sql, params)
+        report["halves"] = cur.fetchone()[0]
+    remaining = sum(report["backfill"].values()) + report["halves"]
     report["backfill_requests"] = remaining
     report["eta_days"] = -(-remaining // avg_leftover) if remaining else 0  # округление вверх
     return report
@@ -914,8 +993,9 @@ def print_backfill_report(conn, since: date, fresh_days: int, avg_leftover: int 
     for grp in ("fresh", "backfill", "deep"):
         r = report[grp]
         print(f"{titles[grp]:<28}{r['events']:>10}{r['statistics']:>12}{r['lineups']:>10}")
+    print(f"\nСтатистика по таймам (все годы, идёт первой): {report['halves']}")
     print(
-        f"\nДозагрузка: {report['backfill_requests']} запросов, "
+        f"Дозагрузка: {report['backfill_requests']} запросов, "
         f"около {report['eta_days']} сут. при среднем остатке {avg_leftover} в сутки."
     )
     return report

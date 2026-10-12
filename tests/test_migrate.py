@@ -83,6 +83,8 @@ def test_up_is_idempotent(conn):
 
 def test_down_then_up_again(conn):
     migrate.run_up(conn)
+    migrate.run_down(conn, "004")
+    assert "fixture_statistics_halves" not in table_names(conn)
     migrate.run_down(conn, "003")
     migrate.run_down(conn, "002")
     migrate.run_down(conn, "001")
