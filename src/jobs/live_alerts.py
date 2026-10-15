@@ -66,12 +66,11 @@ def _score_and_minute(item: dict) -> tuple[int, int, int] | None:
 
 
 def is_candidate(item: dict) -> bool:
-    """Т-1 и Т-2: минута 60–75 и хозяева не выигрывают."""
+    """Т-1: идущий тайм и минута 60–75. Счёт не фильтруется (убрано 15.10.2026)."""
     parsed = _score_and_minute(item)
     if parsed is None:
         return False
-    minute, home, away = parsed
-    return MINUTE_FROM <= minute <= MINUTE_TO and home <= away
+    return MINUTE_FROM <= parsed[0] <= MINUTE_TO
 
 
 def _team_stats(item: dict, team_id: int | None) -> dict[str, object]:
@@ -82,7 +81,7 @@ def _team_stats(item: dict, team_id: int | None) -> dict[str, object]:
 
 
 def build_alert(item: dict) -> Alert | None:
-    """Полный триггер Т-1…Т-4 по ответу `ids=`. None — матч не подходит или данных нет."""
+    """Полный триггер Т-1, Т-3, Т-4 по ответу `ids=`. None — матч не подходит или данных нет."""
     if not is_candidate(item):
         return None
     minute, goals_home, goals_away = _score_and_minute(item)  # type: ignore[misc]
