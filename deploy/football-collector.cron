@@ -35,7 +35,7 @@
 # 00:00 … 00:50 и 01:00. Отправка включена 16.10.2026 (до этого режим --dry-run:
 # только журнал, без отправки); для остановки добавить в строки флаг --dry-run. Бюджет — 300 запросов/сутки
 # (по 10 на запуск), ради чего ежедневный сбор уменьшен с 6500 до 6200:
-# 6200 + 2 x 300 + 50 + 300 (международные) + 300 (оповещения) = 7450 из 7500.
+# 6000 + 2 x 300 + 50 + 300 (международные) + 500 (оповещения, две категории) = 7450 из 7500.
 #
 # settle-bets — расчёт результатов ставок из реестра (specs/реестр-ставок.md),
 # каждые 30 минут. Запросов к API нет, пока нет открытых ставок; потолок 5 на запуск
@@ -46,7 +46,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 3,15 * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh odds 300
 0 6    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh cleanup
 0 8    * * 1  deploy  /opt/apps/football-collector/deploy/run_collect.sh catalog 50
-0 9    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh daily 6200
+0 9    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh daily 6000
 30 9   * * *  deploy  /opt/apps/football-collector/deploy/run_build_features.sh upcoming
 0 10   * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh international-backfill 300
 0 7    * * *  deploy  /opt/apps/football-collector/deploy/check_backup.sh /opt/apps/football-db/backups
