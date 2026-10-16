@@ -1,0 +1,15 @@
+[Unit]
+Description=Бот реестра ставок (внести событие, показать результат)
+After=network-online.target bot-bet-tunnel.service
+Wants=network-online.target
+
+[Service]
+User=deploy
+WorkingDirectory=/opt/apps/football-collector
+EnvironmentFile=/opt/apps/football-collector/.env
+ExecStart=/opt/apps/football-collector/.venv/bin/python -m src.bot.registry_bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

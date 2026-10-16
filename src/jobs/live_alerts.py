@@ -11,12 +11,12 @@ import argparse
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
 from src.api.client import ApiClient
-from src.common.convert import to_int, to_percent
+from src.common.convert import to_int, to_percent, to_utc
 from src.db.connection import connect, database_url
 from src.jobs.collect import collection_run
 
@@ -49,6 +49,8 @@ class Alert:
     possession: int
     shots: int
     opponent_shots: int | None
+    kickoff_at: object = None  # datetime | None
+    alert_id: int | None = None  # номер оповещения; None в режиме dry-run
 
     @property
     def team(self) -> str:
@@ -121,6 +123,7 @@ def build_alert(item: dict) -> Alert | None:
             possession=possession,
             shots=shots,
             opponent_shots=to_int(_team_stats(item, ids[other]).get("Shots on Goal")),
+            kickoff_at=to_utc((item.get("fixture") or {}).get("date")),
         )
     return None
 
@@ -128,7 +131,9 @@ def build_alert(item: dict) -> Alert | None:
 def format_message(alert: Alert) -> str:
     opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
     role = "хозяева" if alert.team_side == "home" else "гости"
+    header = f"ID: {alert.alert_id}\n" if alert.alert_id is not None else "ID: (dry-run)\n"
     return (
+        f"{header}"
         f"Лига: {alert.league} ({alert.country})\n"
         f"Матч: {alert.home} — {alert.away}\n"
         f"Минута: {alert.minute}' | Счёт: {alert.goals_home}:{alert.goals_away}\n"
@@ -191,16 +196,24 @@ def _already_sent(conn, fixture_ids: list[int]) -> set[int]:
         return {row[0] for row in cur.fetchall()}
 
 
+def _reserve_alert_id(conn) -> int:
+    """Номер оповещения резервируется до отправки, чтобы попасть в текст сообщения."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT nextval(pg_get_serial_sequence('live_alerts_sent', 'alert_id'))")
+        return cur.fetchone()[0]
+
+
 def _record_sent(conn, alert: Alert) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO live_alerts_sent (fixture_id, league_id, home_name, away_name, minute,
-                   goals_home, goals_away, team_side, possession, shots_on_goal, opponent_shots_on_goal)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """INSERT INTO live_alerts_sent (alert_id, fixture_id, league_id, home_name, away_name, minute,
+                   goals_home, goals_away, team_side, possession, shots_on_goal, opponent_shots_on_goal,
+                   kickoff_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (fixture_id) DO NOTHING""",
-            (alert.fixture_id, alert.league_id, alert.home, alert.away, alert.minute,
+            (alert.alert_id, alert.fixture_id, alert.league_id, alert.home, alert.away, alert.minute,
              alert.goals_home, alert.goals_away, alert.team_side, alert.possession, alert.shots,
-             alert.opponent_shots),
+             alert.opponent_shots, alert.kickoff_at),
         )
 
 
@@ -237,11 +250,13 @@ def run_live_alerts(
                 if alert is None:
                     ctx.skipped += 1
                     continue
-                message = format_message(alert)
                 if dry_run:
+                    message = format_message(alert)
                     log(f"[dry-run] сработал матч {alert.fixture_id}:\n{message}")
                     ctx.items_processed += 1
                     continue
+                alert = replace(alert, alert_id=_reserve_alert_id(conn))
+                message = format_message(alert)
                 try:
                     send(message)  # type: ignore[misc]
                 except TelegramError as exc:

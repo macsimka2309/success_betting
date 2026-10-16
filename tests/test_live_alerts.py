@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timezone
 
 import pytest
 
@@ -109,6 +110,14 @@ def test_elapsed_none_is_not_a_candidate():
     assert la.is_candidate(live_item(1, minute=None)) is False
 
 
+def test_message_starts_with_alert_id():
+    from dataclasses import replace
+
+    alert = replace(la.build_alert(detail_item(1)), alert_id=17)
+    assert la.format_message(alert).splitlines()[0] == "ID: 17"
+    assert la.format_message(la.build_alert(detail_item(1))).splitlines()[0] == "ID: (dry-run)"
+
+
 def test_message_for_home_team():
     text = la.format_message(la.build_alert(detail_item(1)))
     assert "Home FC — Away FC" in text and "67'" in text and "0:1" in text
@@ -160,6 +169,7 @@ def test_matching_match_sends_one_message_and_records_it(tmp_path, conn):
     client, outbox, ctx = run(tmp_path, conn, bodies)
 
     assert len(outbox.messages) == 1 and "Home FC" in outbox.messages[0]
+    assert outbox.messages[0].splitlines()[0].startswith("ID: ") and "dry-run" not in outbox.messages[0]
     assert client.requests_used == 2
     assert "ids=1" in client.transport.calls[1] and "live=all" in client.transport.calls[0]
     with conn.cursor() as cur:
@@ -174,6 +184,31 @@ def test_away_alert_is_recorded_with_side(tmp_path, conn):
     with conn.cursor() as cur:
         cur.execute("SELECT team_side, possession, shots_on_goal, opponent_shots_on_goal FROM live_alerts_sent")
         assert cur.fetchall() == [("away", 62, 7, 1)]
+
+
+def test_alert_id_in_message_matches_table_and_kickoff_is_stored(tmp_path, conn):
+    item = detail_item(1)
+    item["fixture"]["date"] = "2026-10-16T15:30:00+00:00"
+    _, outbox, _ = run(tmp_path, conn, [{"response": [live_item(1)]}, {"response": [item]}])
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT alert_id, kickoff_at FROM live_alerts_sent WHERE fixture_id = 1")
+        alert_id, kickoff = cur.fetchone()
+    assert outbox.messages[0].splitlines()[0] == f"ID: {alert_id}"
+    assert kickoff.astimezone(timezone.utc).isoformat().startswith("2026-10-16T15:30:00")
+
+
+def test_alert_ids_are_unique_and_failed_send_burns_the_number(tmp_path, conn):
+    bodies = [{"response": [live_item(1), live_item(2)]}, {"response": [detail_item(1), detail_item(2)]}]
+    flaky = Outbox(fail_times=1)
+    with pytest.raises(RuntimeError):
+        run(tmp_path, conn, bodies, outbox=flaky)  # первое сообщение не ушло, второе ушло
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT alert_id FROM live_alerts_sent")
+        ids = [r[0] for r in cur.fetchall()]
+    assert len(ids) == 1 and flaky.messages[0].splitlines()[0] == f"ID: {ids[0]}"
+    assert ids[0] > 1  # номер 1 достался неотправленному оповещению
 
 
 def test_same_match_in_next_run_is_not_sent_again(tmp_path, conn):

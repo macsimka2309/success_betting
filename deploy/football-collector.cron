@@ -36,6 +36,10 @@
 # только журнал, без отправки); для остановки добавить в строки флаг --dry-run. Бюджет — 300 запросов/сутки
 # (по 10 на запуск), ради чего ежедневный сбор уменьшен с 6500 до 6200:
 # 6200 + 2 x 300 + 50 + 300 (международные) + 300 (оповещения) = 7450 из 7500.
+#
+# settle-bets — расчёт результатов ставок из реестра (specs/реестр-ставок.md),
+# каждые 30 минут. Запросов к API нет, пока нет открытых ставок; потолок 5 на запуск
+# берётся из резерва 300/сутки на оповещения, общий лимит не меняется.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -49,3 +53,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 */10 10-23 * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
 */10 0     * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
 0 1        * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
+*/30 *      * * *  deploy  /opt/apps/football-collector/deploy/run_settle_bets.sh
