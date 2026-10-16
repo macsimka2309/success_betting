@@ -17,6 +17,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def ex(possession_by_team):
+    """Точные показатели второго тайма в виде, который возвращает парсер."""
+    return {team: {"possession": value, "shots": None} for team, value in possession_by_team.items()}
+
+
 def exact_body(home_2h, away_2h):
     def block(value):
         return [{"type": "Ball Possession", "value": value}]
@@ -67,31 +72,31 @@ def test_estimate_not_available_in_first_half():
 @pytest.mark.parametrize("value,expected", [(70, False), (71, True), (69, False), (100, True)])
 def test_exact_threshold_is_strictly_above_70(value, expected):
     item = total_item(1, 60, 40)
-    alert = la.build_half_alert(item, {10: value, 20: 100 - value}, {"home": 60, "away": 40})
+    alert = la.build_half_alert(item, ex({10: value, 20: 100 - value}), {"home": 60, "away": 40})
     assert (alert is not None and alert.team_side == "home") == expected
 
 
 def test_either_team_can_trigger():
-    alert = la.build_half_alert(total_item(1, 40, 60), {10: 28, 20: 72}, {"home": 40, "away": 60})
+    alert = la.build_half_alert(total_item(1, 40, 60), ex({10: 28, 20: 72}), {"home": 40, "away": 60})
     assert alert.team_side == "away" and alert.possession == 72 and alert.total_possession == 60
 
 
 def test_half_alert_ignores_outside_window_and_status():
-    assert la.build_half_alert(total_item(1, 60, 40, minute=59), {10: 80, 20: 20}, {}) is None
-    assert la.build_half_alert(total_item(1, 60, 40, minute=76), {10: 80, 20: 20}, {}) is None
+    assert la.build_half_alert(total_item(1, 60, 40, minute=59), ex({10: 80, 20: 20}), {}) is None
+    assert la.build_half_alert(total_item(1, 60, 40, minute=76), ex({10: 80, 20: 20}), {}) is None
     item = total_item(1, 60, 40)
     item["fixture"]["status"]["short"] = "HT"
-    assert la.build_half_alert(item, {10: 80, 20: 20}, {}) is None
+    assert la.build_half_alert(item, ex({10: 80, 20: 20}), {}) is None
 
 
 def test_exact_parser_handles_missing_blocks():
-    assert la._half_possession_exact({"response": [{"team": {"id": 10}, "statistics": []}]}) == {}
-    assert la._half_possession_exact(None) == {}
-    assert la._half_possession_exact(exact_body("74%", "26%")) == {10: 74, 20: 26}
+    assert la._half_stats_exact({"response": [{"team": {"id": 10}, "statistics": []}]}) == {10: {"possession": None, "shots": None}}
+    assert la._half_stats_exact(None) == {}
+    assert la._half_stats_exact(exact_body("74%", "26%"))[10] == {"possession": 74, "shots": None}
 
 
 def test_message_for_half_category():
-    alert = la.build_half_alert(total_item(1, 60, 40), {10: 74, 20: 26}, {"home": 60, "away": 40})
+    alert = la.build_half_alert(total_item(1, 60, 40), ex({10: 74, 20: 26}), {"home": 60, "away": 40})
     text = la.format_message(alert)
     assert "Тип: владение во 2-м тайме" in text and "Владение во 2-м тайме: 74 % (за матч 60 %)" in text
     assert "Команда: Home FC (хозяева)" in text and "Удары" not in text

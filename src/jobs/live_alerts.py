@@ -28,10 +28,17 @@ POSSESSION_ABOVE = 55
 SHOTS_ON_GOAL_MIN = 6
 HALF_POSSESSION_ABOVE = 70
 HALF_PREFILTER = 62  # оценка второго тайма выше этого порога → точный запрос по таймам
+ATTACK_POSSESSION_ABOVE = 55  # категория half_attack: владение во втором тайме строго больше
+ATTACK_SHOTS_MIN = 4  # категория half_attack: удары в створ во втором тайме не меньше
+ATTACK_PREFILTER_POSSESSION = 48  # оценка владения для отбора кандидатов half_attack
 FIRST_HALF_MINUTES = 45
 IDS_BATCH = 20
 DEFAULT_MAX_REQUESTS = 30
-CATEGORY_TITLES = {"stats": "владение и удары в створ", "half": "владение во 2-м тайме"}
+CATEGORY_TITLES = {
+    "stats": "владение и удары в створ",
+    "half": "владение во 2-м тайме",
+    "half_attack": "атака во 2-м тайме",
+}
 
 Sender = Callable[[str], None]
 
@@ -149,6 +156,9 @@ def format_message(alert: Alert) -> str:
     if alert.category == "half":
         total = f" (за матч {alert.total_possession} %)" if alert.total_possession is not None else ""
         lines.append(f"Владение во 2-м тайме: {alert.possession} %{total}")
+    elif alert.category == "half_attack":
+        opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
+        lines.append(f"Во 2-м тайме: владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opponent})")
     else:
         opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
         lines.append(f"Владение: {alert.possession} %")
@@ -204,16 +214,24 @@ def telegram_sender_from_env() -> Sender:
 # ------------------------------------------------- категория half: владение во 2-м тайме
 
 
-def _possession_by_side(item: dict) -> dict[str, int]:
-    """Владение за матч по сторонам: {'home': 58, 'away': 42}; пропущенные стороны не включаются."""
+def _side_values(item: dict, stat_type: str, convert) -> dict[str, int]:
+    """Значение показателя за матч по сторонам: {'home': 58, 'away': 42}; пропущенные не включаются."""
     teams = item.get("teams") or {}
     result = {}
     for side in ("home", "away"):
         team_id = to_int((teams.get(side) or {}).get("id"))
-        value = to_percent(_team_stats(item, team_id).get("Ball Possession")) if team_id is not None else None
+        value = convert(_team_stats(item, team_id).get(stat_type)) if team_id is not None else None
         if value is not None:
             result[side] = value
     return result
+
+
+def _possession_by_side(item: dict) -> dict[str, int]:
+    return _side_values(item, "Ball Possession", to_percent)
+
+
+def _shots_by_side(item: dict) -> dict[str, int]:
+    return _side_values(item, "Shots on Goal", to_int)
 
 
 def estimate_second_half(total: int, first_half: int, minute: int) -> float | None:
@@ -228,48 +246,73 @@ def estimate_second_half(total: int, first_half: int, minute: int) -> float | No
     return (total * minute - first_half * FIRST_HALF_MINUTES) / (minute - FIRST_HALF_MINUTES)
 
 
-def _half_possession_exact(body: dict | None) -> dict[int, int]:
-    """team_id -> владение во втором тайме из ответа `fixtures/statistics?half=true`."""
+def _half_stats_exact(body: dict | None) -> dict[int, dict[str, int | None]]:
+    """team_id -> {'possession', 'shots'} за второй тайм из ответа `fixtures/statistics?half=true`."""
     result = {}
     for entry in (body or {}).get("response") or []:
         team_id = to_int((entry.get("team") or {}).get("id"))
         rows = {r.get("type"): r.get("value") for r in entry.get("statistics_2h") or []}
-        value = to_percent(rows.get("Ball Possession"))
-        if team_id is not None and value is not None:
-            result[team_id] = value
+        if team_id is not None:
+            result[team_id] = {
+                "possession": to_percent(rows.get("Ball Possession")),
+                "shots": to_int(rows.get("Shots on Goal")),
+            }
     return result
 
 
-def build_half_alert(item: dict, exact: dict[int, int], total: dict[str, int]) -> Alert | None:
-    """Категория half: у команды владение во втором тайме строго больше порога."""
-    if not is_candidate(item):
-        return None
+def _base_alert(item: dict, side: str, category: str, **fields) -> Alert:
     minute, goals_home, goals_away = _score_and_minute(item)  # type: ignore[misc]
     teams = item.get("teams") or {}
     league = item.get("league") or {}
+    return Alert(
+        fixture_id=int(item["fixture"]["id"]),
+        league_id=to_int(league.get("id")),
+        league=str(league.get("name") or ""),
+        country=str(league.get("country") or ""),
+        home=str((teams.get("home") or {}).get("name") or ""),
+        away=str((teams.get("away") or {}).get("name") or ""),
+        minute=minute,
+        goals_home=goals_home,
+        goals_away=goals_away,
+        team_side=side,
+        kickoff_at=to_utc((item.get("fixture") or {}).get("date")),
+        category=category,
+        **fields,
+    )
+
+
+def build_half_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
+    """Категория half: у команды владение во втором тайме строго больше порога."""
+    if not is_candidate(item):
+        return None
+    teams = item.get("teams") or {}
     for side in ("home", "away"):
         team_id = to_int((teams.get(side) or {}).get("id"))
-        value = exact.get(team_id) if team_id is not None else None
+        value = (exact.get(team_id) or {}).get("possession") if team_id is not None else None
         if value is None or value <= HALF_POSSESSION_ABOVE:
             continue
-        return Alert(
-            fixture_id=int(item["fixture"]["id"]),
-            league_id=to_int(league.get("id")),
-            league=str(league.get("name") or ""),
-            country=str(league.get("country") or ""),
-            home=str((teams.get("home") or {}).get("name") or ""),
-            away=str((teams.get("away") or {}).get("name") or ""),
-            minute=minute,
-            goals_home=goals_home,
-            goals_away=goals_away,
-            team_side=side,
-            possession=value,
-            shots=None,
-            opponent_shots=None,
-            kickoff_at=to_utc((item.get("fixture") or {}).get("date")),
-            category="half",
-            total_possession=total.get(side),
-        )
+        return _base_alert(item, side, "half", possession=value, shots=None, opponent_shots=None,
+                           total_possession=total.get(side))
+    return None
+
+
+def build_attack_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
+    """Категория half_attack: во втором тайме владение больше 55 % и 4 и более ударов в створ."""
+    if not is_candidate(item):
+        return None
+    teams = item.get("teams") or {}
+    for side, other in (("home", "away"), ("away", "home")):
+        team_id = to_int((teams.get(side) or {}).get("id"))
+        other_id = to_int((teams.get(other) or {}).get("id"))
+        stats = exact.get(team_id) or {}
+        possession, shots = stats.get("possession"), stats.get("shots")
+        if possession is None or shots is None:
+            continue
+        if possession <= ATTACK_POSSESSION_ABOVE or shots < ATTACK_SHOTS_MIN:
+            continue
+        return _base_alert(item, side, "half_attack", possession=possession, shots=shots,
+                           opponent_shots=(exact.get(other_id) or {}).get("shots"),
+                           total_possession=total.get(side))
     return None
 
 
@@ -308,23 +351,29 @@ def _record_sent(conn, alert: Alert) -> None:
         )
 
 
-def _ht_snapshots(conn, fixture_ids: list[int]) -> dict[int, dict[str, int]]:
+def _ht_snapshots(conn, fixture_ids: list[int]) -> dict[int, dict[str, dict[str, int | None]]]:
+    """fixture_id -> {'possession': {'home','away'}, 'shots': {'home','away'}} на перерыве."""
     if not fixture_ids:
         return {}
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT fixture_id, home_possession, away_possession FROM live_ht_possession WHERE fixture_id = ANY(%s)",
+            """SELECT fixture_id, home_possession, away_possession, home_shots_on_goal, away_shots_on_goal
+               FROM live_ht_possession WHERE fixture_id = ANY(%s)""",
             (fixture_ids,),
         )
-        return {row[0]: {"home": row[1], "away": row[2]} for row in cur.fetchall()}
+        return {
+            row[0]: {"possession": {"home": row[1], "away": row[2]}, "shots": {"home": row[3], "away": row[4]}}
+            for row in cur.fetchall()
+        }
 
 
-def _save_ht_snapshot(conn, fixture_id: int, home: int, away: int) -> None:
+def _save_ht_snapshot(conn, fixture_id: int, possession: dict[str, int], shots: dict[str, int]) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO live_ht_possession (fixture_id, home_possession, away_possession)
-               VALUES (%s, %s, %s) ON CONFLICT (fixture_id) DO NOTHING""",
-            (fixture_id, home, away),
+            """INSERT INTO live_ht_possession (fixture_id, home_possession, away_possession,
+                   home_shots_on_goal, away_shots_on_goal)
+               VALUES (%s, %s, %s, %s, %s) ON CONFLICT (fixture_id) DO NOTHING""",
+            (fixture_id, possession["home"], possession["away"], shots.get("home"), shots.get("away")),
         )
 
 
@@ -388,14 +437,18 @@ def run_live_alerts(
         for item in _fetch_by_ids(client, [i for i in ht_ids if i not in known]):
             possession = _possession_by_side(item)
             if len(possession) == 2:
-                _save_ht_snapshot(conn, int(item["fixture"]["id"]), possession["home"], possession["away"])
+                _save_ht_snapshot(conn, int(item["fixture"]["id"]), possession, _shots_by_side(item))
         _purge_old_snapshots(conn)
 
         candidates = [item for item in items if is_candidate(item)]
         ids = [int(item["fixture"]["id"]) for item in candidates]
-        sent = {c: _already_sent(conn, ids, c) for c in ("stats", "half")}
+        sent = {c: _already_sent(conn, ids, c) for c in CATEGORY_TITLES}
         snapshots = _ht_snapshots(conn, ids)
-        need = [i for i in ids if i not in sent["stats"] or (i not in sent["half"] and i in snapshots)]
+
+        def second_half_pending(fixture_id: int) -> bool:
+            return fixture_id in snapshots and (fixture_id not in sent["half"] or fixture_id not in sent["half_attack"])
+
+        need = [i for i in ids if i not in sent["stats"] or second_half_pending(i)]
         for item in _fetch_by_ids(client, need):
             fixture_id = int(item["fixture"]["id"])
             fired = False
@@ -403,19 +456,33 @@ def run_live_alerts(
                 alert = build_alert(item)
                 if alert is not None:
                     fired = deliver(alert) or fired
-            if fixture_id not in sent["half"] and fixture_id in snapshots and is_candidate(item):
+            if second_half_pending(fixture_id) and is_candidate(item):
                 minute = _score_and_minute(item)[0]  # type: ignore[index]
                 total = _possession_by_side(item)
-                likely = [
-                    side for side in ("home", "away")
-                    if side in total and (est := estimate_second_half(total[side], snapshots[fixture_id][side], minute)) is not None
-                    and est > HALF_PREFILTER
-                ]
-                if likely and _budget_left(client):
+                total_shots = _shots_by_side(item)
+                snap = snapshots[fixture_id]
+                want_half = want_attack = False
+                for side in ("home", "away"):
+                    first = snap["possession"].get(side)
+                    est = estimate_second_half(total[side], first, minute) if side in total and first is not None else None
+                    if fixture_id not in sent["half"] and est is not None and est > HALF_PREFILTER:
+                        want_half = True
+                    shots_first = snap["shots"].get(side)
+                    if (fixture_id not in sent["half_attack"] and side in total_shots and shots_first is not None
+                            and total_shots[side] - shots_first >= ATTACK_SHOTS_MIN
+                            and (est is None or est > ATTACK_PREFILTER_POSSESSION)):
+                        want_attack = True
+                if (want_half or want_attack) and _budget_left(client):
                     body = client.get("/fixtures/statistics", {"fixture": fixture_id, "half": "true"}, use_cache=False)
-                    alert = build_half_alert(item, _half_possession_exact(body), total)
-                    if alert is not None:
-                        fired = deliver(alert) or fired
+                    exact = _half_stats_exact(body)
+                    if want_half:
+                        alert = build_half_alert(item, exact, total)
+                        if alert is not None:
+                            fired = deliver(alert) or fired
+                    if want_attack:
+                        alert = build_attack_alert(item, exact, total)
+                        if alert is not None:
+                            fired = deliver(alert) or fired
             if not fired:
                 ctx.skipped += 1
         if failed_sends:
