@@ -30,14 +30,19 @@ def live_item(fid, minute=67, home=0, away=1, status="2H"):
     }
 
 
-def detail_item(fid, possession="58%", shots_home=7, shots_away=2, **kwargs):
+def detail_item(fid, possession="58%", shots_home=7, shots_away=2, away_possession=None, **kwargs):
     item = live_item(fid, **kwargs)
+    if away_possession is None:
+        away_possession = "42%"
     item["statistics"] = [
         {"team": {"id": 10}, "statistics": [
             {"type": "Ball Possession", "value": possession},
             {"type": "Shots on Goal", "value": shots_home},
         ]},
-        {"team": {"id": 20}, "statistics": [{"type": "Shots on Goal", "value": shots_away}]},
+        {"team": {"id": 20}, "statistics": [
+            {"type": "Ball Possession", "value": away_possession},
+            {"type": "Shots on Goal", "value": shots_away},
+        ]},
     ]
     return item
 
@@ -104,12 +109,47 @@ def test_elapsed_none_is_not_a_candidate():
     assert la.is_candidate(live_item(1, minute=None)) is False
 
 
-def test_message_contains_numbers_and_unknown_away_shots():
+def test_message_for_home_team():
+    text = la.format_message(la.build_alert(detail_item(1)))
+    assert "Home FC — Away FC" in text and "67'" in text and "0:1" in text
+    assert "Команда: Home FC (хозяева)" in text
+    assert "Владение: 58 %" in text and "Удары в створ: 7 против 2" in text
+
+
+def test_message_with_unknown_opponent_shots():
     item = detail_item(1)
     item["statistics"][1]["statistics"] = []
-    text = la.format_message(la.build_alert(item))
-    assert "Home FC — Away FC" in text and "67'" in text and "0:1" in text
-    assert "58 %" in text and "хозяева 7, гости ?" in text
+    assert "7 против ?" in la.format_message(la.build_alert(item))
+
+
+# ------------------------------------------------ триггер для гостей (16.10.2026)
+
+
+def test_away_team_triggers_when_it_has_the_stats():
+    item = detail_item(1, possession="40%", shots_home=1, away_possession="60%", shots_away=8, home=2, away=0)
+    alert = la.build_alert(item)
+
+    assert alert is not None and alert.team_side == "away" and alert.team == "Away FC"
+    assert (alert.possession, alert.shots, alert.opponent_shots) == (60, 8, 1)
+    text = la.format_message(alert)
+    assert "Команда: Away FC (гости)" in text and "Удары в створ: 8 против 1" in text
+
+
+def test_away_boundaries():
+    assert la.build_alert(detail_item(1, possession="40%", away_possession="55%", shots_away=8)) is None
+    assert la.build_alert(detail_item(1, possession="40%", away_possession="56%", shots_away=5)) is None
+    assert la.build_alert(detail_item(1, possession="40%", away_possession="56%", shots_away=6)) is not None
+
+
+def test_stats_of_different_teams_are_not_mixed():
+    """Владение у хозяев, удары в створ у гостей: ни одна команда не проходит оба условия."""
+    item = detail_item(1, possession="60%", shots_home=2, away_possession="40%", shots_away=9)
+    assert la.build_alert(item) is None
+
+
+def test_garbage_away_stats_do_not_alert():
+    item = detail_item(1, possession="40%", shots_home=1, away_possession="n/a", shots_away=9)
+    assert la.build_alert(item) is None
 
 
 # --------------------------------------------------- запуск, дубли, повторы
@@ -123,8 +163,17 @@ def test_matching_match_sends_one_message_and_records_it(tmp_path, conn):
     assert client.requests_used == 2
     assert "ids=1" in client.transport.calls[1] and "live=all" in client.transport.calls[0]
     with conn.cursor() as cur:
-        cur.execute("SELECT fixture_id, possession_home, shots_on_goal_home FROM live_alerts_sent")
-        assert cur.fetchall() == [(1, 58, 7)]
+        cur.execute("SELECT fixture_id, team_side, possession, shots_on_goal, opponent_shots_on_goal FROM live_alerts_sent")
+        assert cur.fetchall() == [(1, "home", 58, 7, 2)]
+
+
+def test_away_alert_is_recorded_with_side(tmp_path, conn):
+    item = detail_item(1, possession="40%", shots_home=1, away_possession="62%", shots_away=7)
+    run(tmp_path, conn, [{"response": [live_item(1)]}, {"response": [item]}])
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT team_side, possession, shots_on_goal, opponent_shots_on_goal FROM live_alerts_sent")
+        assert cur.fetchall() == [("away", 62, 7, 1)]
 
 
 def test_same_match_in_next_run_is_not_sent_again(tmp_path, conn):

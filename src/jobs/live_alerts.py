@@ -45,9 +45,14 @@ class Alert:
     minute: int
     goals_home: int
     goals_away: int
-    possession_home: int
-    shots_home: int
-    shots_away: int | None
+    team_side: str  # 'home' или 'away': команда, по которой сработал триггер
+    possession: int
+    shots: int
+    opponent_shots: int | None
+
+    @property
+    def team(self) -> str:
+        return self.home if self.team_side == "home" else self.away
 
 
 # ------------------------------------------------------------------- триггер
@@ -81,47 +86,55 @@ def _team_stats(item: dict, team_id: int | None) -> dict[str, object]:
 
 
 def build_alert(item: dict) -> Alert | None:
-    """Полный триггер Т-1, Т-3, Т-4 по ответу `ids=`. None — матч не подходит или данных нет."""
+    """Триггер Т-1, Т-3, Т-4 по ответу `ids=` для любой из двух команд.
+
+    Владение больше 55 % возможно только у одной команды, поэтому оповещение
+    по матчу не больше одного. None — матч не подходит или данных нет.
+    """
     if not is_candidate(item):
         return None
     minute, goals_home, goals_away = _score_and_minute(item)  # type: ignore[misc]
     teams = item.get("teams") or {}
-    home_id = to_int((teams.get("home") or {}).get("id"))
-    away_id = to_int((teams.get("away") or {}).get("id"))
-    if home_id is None:
-        return None
-    home_stats = _team_stats(item, home_id)
-    possession = to_percent(home_stats.get("Ball Possession"))
-    shots = to_int(home_stats.get("Shots on Goal"))
-    if possession is None or shots is None:
-        return None
-    if possession <= POSSESSION_ABOVE or shots < SHOTS_ON_GOAL_MIN:
-        return None
+    ids = {side: to_int((teams.get(side) or {}).get("id")) for side in ("home", "away")}
     league = item.get("league") or {}
-    return Alert(
-        fixture_id=int(item["fixture"]["id"]),
-        league_id=to_int(league.get("id")),
-        league=str(league.get("name") or ""),
-        country=str(league.get("country") or ""),
-        home=str((teams.get("home") or {}).get("name") or ""),
-        away=str((teams.get("away") or {}).get("name") or ""),
-        minute=minute,
-        goals_home=goals_home,
-        goals_away=goals_away,
-        possession_home=possession,
-        shots_home=shots,
-        shots_away=to_int(_team_stats(item, away_id).get("Shots on Goal")),
-    )
+    for side, other in (("home", "away"), ("away", "home")):
+        if ids[side] is None:
+            continue
+        stats = _team_stats(item, ids[side])
+        possession = to_percent(stats.get("Ball Possession"))
+        shots = to_int(stats.get("Shots on Goal"))
+        if possession is None or shots is None:
+            continue
+        if possession <= POSSESSION_ABOVE or shots < SHOTS_ON_GOAL_MIN:
+            continue
+        return Alert(
+            fixture_id=int(item["fixture"]["id"]),
+            league_id=to_int(league.get("id")),
+            league=str(league.get("name") or ""),
+            country=str(league.get("country") or ""),
+            home=str((teams.get("home") or {}).get("name") or ""),
+            away=str((teams.get("away") or {}).get("name") or ""),
+            minute=minute,
+            goals_home=goals_home,
+            goals_away=goals_away,
+            team_side=side,
+            possession=possession,
+            shots=shots,
+            opponent_shots=to_int(_team_stats(item, ids[other]).get("Shots on Goal")),
+        )
+    return None
 
 
 def format_message(alert: Alert) -> str:
-    away_shots = "?" if alert.shots_away is None else alert.shots_away
+    opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
+    role = "хозяева" if alert.team_side == "home" else "гости"
     return (
         f"Лига: {alert.league} ({alert.country})\n"
         f"Матч: {alert.home} — {alert.away}\n"
         f"Минута: {alert.minute}' | Счёт: {alert.goals_home}:{alert.goals_away}\n"
-        f"Владение хозяев: {alert.possession_home} %\n"
-        f"Удары в створ: хозяева {alert.shots_home}, гости {away_shots}"
+        f"Команда: {alert.team} ({role})\n"
+        f"Владение: {alert.possession} %\n"
+        f"Удары в створ: {alert.shots} против {opponent}"
     )
 
 
@@ -182,11 +195,12 @@ def _record_sent(conn, alert: Alert) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO live_alerts_sent (fixture_id, league_id, home_name, away_name, minute,
-                   goals_home, goals_away, possession_home, shots_on_goal_home, shots_on_goal_away)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   goals_home, goals_away, team_side, possession, shots_on_goal, opponent_shots_on_goal)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (fixture_id) DO NOTHING""",
             (alert.fixture_id, alert.league_id, alert.home, alert.away, alert.minute,
-             alert.goals_home, alert.goals_away, alert.possession_home, alert.shots_home, alert.shots_away),
+             alert.goals_home, alert.goals_away, alert.team_side, alert.possession, alert.shots,
+             alert.opponent_shots),
         )
 
 
