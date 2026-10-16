@@ -32,8 +32,8 @@
 #
 # live-alerts — оповещения по идущим матчам в Telegram (specs/онлайн-оповещения.md,
 # утверждена 15.10.2026). Каждые 10 минут с 10:00 до 01:00 МСК: в 10:00 … 23:50,
-# 00:00 … 00:50 и 01:00. Режим --dry-run: только журнал, без отправки; когда
-# отправка настроена и проверена за сутки, флаг убрать. Бюджет — 300 запросов/сутки
+# 00:00 … 00:50 и 01:00. Отправка включена 16.10.2026 (до этого режим --dry-run:
+# только журнал, без отправки); для остановки добавить в строки флаг --dry-run. Бюджет — 300 запросов/сутки
 # (по 10 на запуск), ради чего ежедневный сбор уменьшен с 6500 до 6200:
 # 6200 + 2 x 300 + 50 + 300 (международные) + 300 (оповещения) = 7450 из 7500.
 SHELL=/bin/bash
@@ -46,6 +46,6 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 30 9   * * *  deploy  /opt/apps/football-collector/deploy/run_build_features.sh upcoming
 0 10   * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh international-backfill 300
 0 7    * * *  deploy  /opt/apps/football-collector/deploy/check_backup.sh /opt/apps/football-db/backups
-*/10 10-23 * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh --dry-run
-*/10 0     * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh --dry-run
-0 1        * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh --dry-run
+*/10 10-23 * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
+*/10 0     * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
+0 1        * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
