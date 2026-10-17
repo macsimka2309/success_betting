@@ -21,11 +21,12 @@ MENU_ADD = "Внести событие"
 MENU_REPORT = "Показать результат"
 MENU_HITS = "Проходимость"
 CANCEL = "Отмена"
-MARKET_TITLES = {"TB": "ТБ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}
+MARKET_TITLES = {"TB": "ТБ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}  # названия для уже записанных ставок
+ALLOWED_MARKETS = ("TB",)  # доступны для выбора с 17.10.2026; ИТБ1 и ИТБ2 убраны по решению владельца
 MENU = {"keyboard": [[{"text": MENU_ADD}, {"text": MENU_REPORT}], [{"text": MENU_HITS}]], "resize_keyboard": True}
 MARKET_KEYBOARD = {
     "inline_keyboard": [
-        [{"text": title, "callback_data": f"mkt:{code}"} for code, title in MARKET_TITLES.items()],
+        [{"text": MARKET_TITLES[code], "callback_data": f"mkt:{code}"} for code in ALLOWED_MARKETS],
         [{"text": CANCEL, "callback_data": "cancel"}],
     ]
 }
@@ -188,7 +189,7 @@ class Bot:
         elif step == "alert_id":
             self._step_alert_id(text)
         elif step == "market":
-            self.api.send(self.owner, "Выберите рынок кнопкой: ТБ, ИТБ1 или ИТБ2", MARKET_KEYBOARD)
+            self.api.send(self.owner, "Выберите рынок кнопкой: ТБ", MARKET_KEYBOARD)
         elif step == "line":
             self._step_line(text, payload)
         elif step == "amount":
@@ -266,7 +267,7 @@ class Bot:
         if data == "cancel":
             self._set_dialog(None, {})
             self.api.send(self.owner, "Отменено", MENU)
-        elif data.startswith("mkt:") and step == "market" and data[4:] in MARKET_TITLES:
+        elif data.startswith("mkt:") and step == "market" and data[4:] in ALLOWED_MARKETS:
             self._set_dialog("line", {**payload, "market": data[4:]})
             self.api.send(self.owner, "Введите число (линия), например 2.5")
         elif data in ("rep:day", "rep:month"):

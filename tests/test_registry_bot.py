@@ -80,10 +80,10 @@ def bets(conn):
 
 def test_full_dialog_creates_bet(env):
     bot, api, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:ITB1", "1.5", "250", "1.85")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "1.5", "250", "1.85")
 
-    assert bets(conn) == [(alert_id, 500, "ITB1", D("1.50"), D("250.00"), D("1.850"), "open")]
-    assert "Записано" in api.last and "ИТБ1" in api.last and "1.50" in api.last
+    assert bets(conn) == [(alert_id, 500, "TB", D("1.50"), D("250.00"), D("1.850"), "open")]
+    assert "Записано" in api.last and "ТБ" in api.last and "1.50" in api.last
     with conn.cursor() as cur:
         cur.execute("SELECT kickoff_at IS NOT NULL FROM bets")
         assert cur.fetchone()[0] is True  # время матча взято из оповещения
@@ -113,7 +113,7 @@ def test_comma_decimal_is_accepted(env):
 def test_several_bets_on_one_alert(env):
     bot, _, up, conn, alert_id = env
     feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", "100", "1.9",
-         rb.MENU_ADD, str(alert_id), "@mkt:ITB2", "0.5", "50", "1.5")
+         rb.MENU_ADD, str(alert_id), "@mkt:TB", "0.5", "50", "1.5")
 
     assert len(bets(conn)) == 2
 
@@ -161,6 +161,21 @@ def test_boundary_values_accepted(env):
          rb.MENU_ADD, str(alert_id), "@mkt:TB", "20", "0.01", "1000")
 
     assert [b[3:6] for b in bets(conn)] == [(D("0.25"), D("1000000.00"), D("1.001")), (D("20.00"), D("0.01"), D("1000.000"))]
+
+
+def test_only_total_over_button_is_offered(env):
+    buttons = [b["text"] for row in rb.MARKET_KEYBOARD["inline_keyboard"] for b in row]
+    assert buttons == ["ТБ", "Отмена"]
+
+
+@pytest.mark.parametrize("old", ["ITB1", "ITB2", "XYZ"])
+def test_removed_markets_are_rejected_even_from_old_keyboards(env, old):
+    bot, api, up, conn, alert_id = env
+    feed(bot, up, rb.MENU_ADD, str(alert_id), f"@mkt:{old}")
+
+    assert bets(conn) == [] and "меню" in api.last
+    feed(bot, up, "2.5")  # диалог остался на шаге выбора рынка, линия не принимается
+    assert "кнопкой" in api.last
 
 
 def test_typing_instead_of_pressing_market_button(env):
