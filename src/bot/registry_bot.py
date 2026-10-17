@@ -19,9 +19,10 @@ from src.db.connection import connect, database_url
 
 MENU_ADD = "Внести событие"
 MENU_REPORT = "Показать результат"
+MENU_HITS = "Проходимость"
 CANCEL = "Отмена"
 MARKET_TITLES = {"TB": "ТБ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}
-MENU = {"keyboard": [[{"text": MENU_ADD}, {"text": MENU_REPORT}]], "resize_keyboard": True}
+MENU = {"keyboard": [[{"text": MENU_ADD}, {"text": MENU_REPORT}], [{"text": MENU_HITS}]], "resize_keyboard": True}
 MARKET_KEYBOARD = {
     "inline_keyboard": [
         [{"text": title, "callback_data": f"mkt:{code}"} for code, title in MARKET_TITLES.items()],
@@ -89,6 +90,32 @@ def format_report(rows: list[tuple[str, int, Decimal, int]], mode: str) -> str:
     return text
 
 
+HIT_TITLES = {"stats": "Владение+удары", "half": "Владение 2Т>70", "half_attack": "Атака 2Т"}
+
+
+def hit_rate_rows(conn) -> list[tuple[str, int, int, int, int]]:
+    """(категория, оповещений, оценено, голов после 75-й, ожидают) из представления alert_hit_rate."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT category, alerts, resolved, hits, pending FROM alert_hit_rate ORDER BY category")
+        return cur.fetchall()
+
+
+def format_hit_rate(rows: list[tuple[str, int, int, int, int]]) -> str:
+    if not rows:
+        return "Оповещений пока нет"
+    lines = [f"{'Категория':<16}{'Всего':>6}{'Оценено':>9}{'Гол 75+':>9}{'%':>6}"]
+    total = [0, 0, 0, 0]
+    for category, alerts, resolved, hits, pending in rows:
+        percent = f"{100 * hits / resolved:.0f}" if resolved else "-"
+        lines.append(f"{HIT_TITLES.get(category, category):<16}{alerts:>6}{resolved:>9}{hits:>9}{percent:>6}")
+        for index, value in enumerate((alerts, resolved, hits, pending)):
+            total[index] += value
+    percent = f"{100 * total[2] / total[1]:.0f}" if total[1] else "-"
+    lines.append(f"{'Итого':<16}{total[0]:>6}{total[1]:>9}{total[2]:>9}{percent:>6}")
+    text = "<pre>" + html.escape("\n".join(lines)) + "</pre>"
+    return text + (f"\nОжидают конца матча: {total[3]}" if total[3] else "") + "\nГол после 75-й минуты, основное время"
+
+
 # --------------------------------------------------------------------- бот
 
 
@@ -152,6 +179,9 @@ class Bot:
         elif text == MENU_ADD:
             self._set_dialog("alert_id", {})
             self.api.send(self.owner, "Введите ID оповещения")
+        elif text == MENU_HITS:
+            self._set_dialog(None, {})
+            self.api.send(self.owner, format_hit_rate(hit_rate_rows(self.conn)), MENU, html=True)
         elif text == MENU_REPORT:
             self._set_dialog(None, {})
             self.api.send(self.owner, "Выберите период", REPORT_KEYBOARD)
