@@ -149,3 +149,13 @@ def test_failed_notification_is_retried(tmp_path, conn):
     settle_bets.run_settle(make_client(tmp_path / "b", bodies), conn, notify=sent.append)
 
     assert len(sent) == 1
+
+
+def test_total_under_is_settled(tmp_path, conn):
+    won, lost = add_bet(conn, 1, "TM", "2.5"), add_bet(conn, 2, "TM", "2.5")
+    client = make_client(tmp_path, [{"response": [fixture(1, home=1, away=1), fixture(2, home=2, away=1)]}])
+
+    settle_bets.run_settle(client, conn)
+
+    assert bet(conn, won)[0] == "won" and bet(conn, won)[3] == D("90.000")
+    assert bet(conn, lost)[0] == "lost" and bet(conn, lost)[3] == D("-100.000")

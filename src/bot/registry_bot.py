@@ -21,8 +21,8 @@ MENU_ADD = "Внести событие"
 MENU_REPORT = "Показать результат"
 MENU_HITS = "Проходимость"
 CANCEL = "Отмена"
-MARKET_TITLES = {"TB": "ТБ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}  # названия для уже записанных ставок
-ALLOWED_MARKETS = ("TB",)  # доступны для выбора с 17.10.2026; ИТБ1 и ИТБ2 убраны по решению владельца
+MARKET_TITLES = {"TB": "ТБ", "TM": "ТМ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}  # названия для записанных ставок
+ALLOWED_MARKETS = ("TB", "TM")  # доступны для выбора; ИТБ1 и ИТБ2 убраны 17.10.2026, ТМ добавлен
 MENU = {"keyboard": [[{"text": MENU_ADD}, {"text": MENU_REPORT}], [{"text": MENU_HITS}]], "resize_keyboard": True}
 MARKET_KEYBOARD = {
     "inline_keyboard": [
@@ -189,7 +189,7 @@ class Bot:
         elif step == "alert_id":
             self._step_alert_id(text)
         elif step == "market":
-            self.api.send(self.owner, "Выберите рынок кнопкой: ТБ", MARKET_KEYBOARD)
+            self.api.send(self.owner, "Выберите рынок кнопкой: ТБ или ТМ", MARKET_KEYBOARD)
         elif step == "line":
             self._step_line(text, payload)
         elif step == "amount":

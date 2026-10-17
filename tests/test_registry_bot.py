@@ -163,9 +163,17 @@ def test_boundary_values_accepted(env):
     assert [b[3:6] for b in bets(conn)] == [(D("0.25"), D("1000000.00"), D("1.001")), (D("20.00"), D("0.01"), D("1000.000"))]
 
 
-def test_only_total_over_button_is_offered(env):
+def test_only_total_markets_are_offered(env):
     buttons = [b["text"] for row in rb.MARKET_KEYBOARD["inline_keyboard"] for b in row]
-    assert buttons == ["ТБ", "Отмена"]
+    assert buttons == ["ТБ", "ТМ", "Отмена"]
+
+
+def test_total_under_dialog_creates_tm_bet(env):
+    bot, api, up, conn, alert_id = env
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TM", "2.5", "100", "1.9")
+
+    assert bets(conn) == [(alert_id, 500, "TM", D("2.50"), D("100.00"), D("1.900"), "open")]
+    assert "ТМ" in api.last
 
 
 @pytest.mark.parametrize("old", ["ITB1", "ITB2", "XYZ"])

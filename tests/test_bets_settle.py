@@ -19,6 +19,11 @@ from src.bets.settle import compared_goals, profit, settle
         ("ITB2", "0.75", 0, 1, "half_won"), ("ITB1", "0.25", 0, 3, "half_lost"),
         ("ITB1", "0.25", 1, 0, "won"),
         ("TB", "20", 0, 0, "lost"),
+        ("TM", "2.5", 1, 1, "won"), ("TM", "2.5", 2, 1, "lost"),
+        ("TM", "2.0", 1, 1, "push"), ("TM", "2.0", 0, 1, "won"), ("TM", "2.0", 2, 1, "lost"),
+        ("TM", "2.25", 1, 0, "won"), ("TM", "2.25", 1, 1, "half_won"), ("TM", "2.25", 2, 1, "lost"),
+        ("TM", "2.75", 1, 1, "won"), ("TM", "2.75", 2, 1, "half_lost"), ("TM", "2.75", 2, 2, "lost"),
+        ("TM", "0.5", 0, 0, "won"), ("TM", "0.5", 1, 0, "lost"),
     ],
 )
 def test_settle_table(market, line, home, away, expected):
@@ -27,6 +32,7 @@ def test_settle_table(market, line, home, away, expected):
 
 def test_compared_goals():
     assert compared_goals("TB", 2, 3) == 5
+    assert compared_goals("TM", 2, 3) == 5
     assert compared_goals("ITB1", 2, 3) == 2
     assert compared_goals("ITB2", 2, 3) == 3
 
@@ -53,3 +59,11 @@ def test_profit(status, expected):
 
 def test_profit_rounds_to_thousandths():
     assert profit("half_won", D("10"), D("1.333")) == D("1.665")
+
+
+@pytest.mark.parametrize("line", ["0.5", "1.0", "1.5", "2.0", "2.25", "2.5", "2.75", "3.5"])
+@pytest.mark.parametrize("total", range(0, 7))
+def test_tm_is_mirror_of_tb(line, total):
+    """На любом счёте ТБ и ТМ дают зеркальный результат, возврат остаётся возвратом."""
+    mirror = {"won": "lost", "lost": "won", "half_won": "half_lost", "half_lost": "half_won", "push": "push"}
+    assert settle("TM", D(line), total, 0) == mirror[settle("TB", D(line), total, 0)]
