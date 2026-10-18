@@ -324,3 +324,9 @@ def test_sender_requires_token_and_chat(monkeypatch):
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     with pytest.raises(SystemExit):
         la.telegram_sender_from_env()
+
+
+@pytest.fixture(autouse=True)
+def _legacy_categories_enabled(monkeypatch):
+    """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
+    monkeypatch.setattr(la, "ENABLED_CATEGORIES", la.LEGACY_CATEGORIES)

@@ -166,3 +166,9 @@ def test_attack_alert_not_repeated(tmp_path, conn):
     # а half_attack уже отправлена и повторно не уходит
     assert [m.splitlines()[1] for m in outbox.messages] == ["Тип: владение во 2-м тайме"]
     assert client.requests_used == 3
+
+
+@pytest.fixture(autouse=True)
+def _legacy_categories_enabled(monkeypatch):
+    """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
+    monkeypatch.setattr(la, "ENABLED_CATEGORIES", la.LEGACY_CATEGORIES)

@@ -223,3 +223,9 @@ def test_dry_run_half_does_not_record(tmp_path, conn):
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM live_alerts_sent")
         assert cur.fetchone()[0] == 0
+
+
+@pytest.fixture(autouse=True)
+def _legacy_categories_enabled(monkeypatch):
+    """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
+    monkeypatch.setattr(la, "ENABLED_CATEGORIES", la.LEGACY_CATEGORIES)
