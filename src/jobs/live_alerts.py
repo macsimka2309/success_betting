@@ -26,13 +26,15 @@ LIVE_STATUSES = ("1H", "2H")
 MINUTE_FROM, MINUTE_TO = 60, 75
 POSSESSION_ABOVE = 55
 SHOTS_ON_GOAL_MIN = 6
-HALF_POSSESSION_ABOVE = 70
+HALF_POSSESSION_MIN = 70  # владение во втором тайме не меньше (с 18.10.2026; раньше строго больше)
+HALF_MINUTE_FROM = 65
+HALF_MAX_LEAD = 1  # команда проигрывает, играет вничью или ведёт не больше чем на мяч
 HALF_PREFILTER = 62  # оценка второго тайма выше этого порога → точный запрос по таймам
 ATTACK_POSSESSION_ABOVE = 55  # категория half_attack: владение во втором тайме строго больше
 ATTACK_SHOTS_MIN = 4  # категория half_attack: удары в створ во втором тайме не меньше
 ATTACK_PREFILTER_POSSESSION = 48  # оценка владения для отбора кандидатов half_attack
 FIRST_HALF_MINUTES = 45
-ENABLED_CATEGORIES = ("favorite",)  # stats/half/half_attack отключены 18.10.2026
+ENABLED_CATEGORIES = ("favorite", "half")  # stats и half_attack отключены 18.10.2026
 LEGACY_CATEGORIES = ("stats", "half", "half_attack")
 FAVORITE_MINUTE_FROM, FAVORITE_MINUTE_TO = 65, 75
 FAVORITE_SHARE = 0.2  # верхние и нижние 20 % таблицы
@@ -296,15 +298,27 @@ def _base_alert(item: dict, side: str, category: str, **fields) -> Alert:
     )
 
 
+def _lead(item: dict, side: str) -> int:
+    _, home, away = _score_and_minute(item)  # type: ignore[misc]
+    return home - away if side == "home" else away - home
+
+
+def is_half_candidate(item: dict) -> bool:
+    """Идущий тайм и минута 65–75."""
+    parsed = _score_and_minute(item)
+    return parsed is not None and HALF_MINUTE_FROM <= parsed[0] <= MINUTE_TO
+
+
 def build_half_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
-    """Категория half: у команды владение во втором тайме строго больше порога."""
-    if not is_candidate(item):
+    """Категория half: минута 65–75, владение команды во втором тайме не меньше 70 %,
+    команда проигрывает, играет вничью или ведёт не больше чем на один мяч."""
+    if not is_half_candidate(item):
         return None
     teams = item.get("teams") or {}
     for side in ("home", "away"):
         team_id = to_int((teams.get(side) or {}).get("id"))
         value = (exact.get(team_id) or {}).get("possession") if team_id is not None else None
-        if value is None or value <= HALF_POSSESSION_ABOVE:
+        if value is None or value < HALF_POSSESSION_MIN or _lead(item, side) > HALF_MAX_LEAD:
             continue
         return _base_alert(item, side, "half", possession=value, shots=None, opponent_shots=None,
                            total_possession=total.get(side))
@@ -549,14 +563,18 @@ def run_live_alerts(
             sent = {c: _already_sent(conn, ids, c) for c in CATEGORY_TITLES}
             snapshots = _ht_snapshots(conn, ids)
 
-            def second_half_pending(fixture_id: int) -> bool:
-                return fixture_id in snapshots and (fixture_id not in sent["half"] or fixture_id not in sent["half_attack"])
+            on = {c: c in categories for c in LEGACY_CATEGORIES}
 
-            need = [i for i in ids if i not in sent["stats"] or second_half_pending(i)]
+            def second_half_pending(fixture_id: int) -> bool:
+                return fixture_id in snapshots and (
+                    (on["half"] and fixture_id not in sent["half"])
+                    or (on["half_attack"] and fixture_id not in sent["half_attack"]))
+
+            need = [i for i in ids if (on["stats"] and i not in sent["stats"]) or second_half_pending(i)]
             for item in _fetch_by_ids(client, need):
                 fixture_id = int(item["fixture"]["id"])
                 fired = False
-                if fixture_id not in sent["stats"]:
+                if on["stats"] and fixture_id not in sent["stats"]:
                     alert = build_alert(item)
                     if alert is not None:
                         fired = deliver(alert) or fired
@@ -569,10 +587,11 @@ def run_live_alerts(
                     for side in ("home", "away"):
                         first = snap["possession"].get(side)
                         est = estimate_second_half(total[side], first, minute) if side in total and first is not None else None
-                        if fixture_id not in sent["half"] and est is not None and est > HALF_PREFILTER:
+                        if (on["half"] and fixture_id not in sent["half"] and is_half_candidate(item)
+                                and _lead(item, side) <= HALF_MAX_LEAD and est is not None and est > HALF_PREFILTER):
                             want_half = True
                         shots_first = snap["shots"].get(side)
-                        if (fixture_id not in sent["half_attack"] and side in total_shots and shots_first is not None
+                        if (on["half_attack"] and fixture_id not in sent["half_attack"] and side in total_shots and shots_first is not None
                                 and total_shots[side] - shots_first >= ATTACK_SHOTS_MIN
                                 and (est is None or est > ATTACK_PREFILTER_POSSESSION)):
                             want_attack = True

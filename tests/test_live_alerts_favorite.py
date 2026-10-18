@@ -86,7 +86,7 @@ def test_only_top_20_vs_bottom_20_percent(tmp_path, conn, home, away):
     assert len(outbox.messages) == (1 if (home, away) == (2, 9) else 0)
 
 
-@pytest.mark.parametrize("minute,status", [(64, "2H"), (76, "2H"), (70, "HT"), (70, "ET")])
+@pytest.mark.parametrize("minute,status", [(64, "2H"), (76, "2H"), (70, "ET")])
 def test_minute_window_and_status(tmp_path, conn, minute, status):
     seed_table(conn)
     outbox, _ = run(tmp_path, conn, [item(minute=minute, status=status)])

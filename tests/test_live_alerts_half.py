@@ -69,8 +69,8 @@ def test_estimate_not_available_in_first_half():
     assert la.estimate_second_half(60, 50, 30) is None
 
 
-@pytest.mark.parametrize("value,expected", [(70, False), (71, True), (69, False), (100, True)])
-def test_exact_threshold_is_strictly_above_70(value, expected):
+@pytest.mark.parametrize("value,expected", [(70, True), (71, True), (69, False), (100, True)])
+def test_exact_threshold_is_70_or_more(value, expected):
     item = total_item(1, 60, 40)
     alert = la.build_half_alert(item, ex({10: value, 20: 100 - value}), {"home": 60, "away": 40})
     assert (alert is not None and alert.team_side == "home") == expected
@@ -82,7 +82,7 @@ def test_either_team_can_trigger():
 
 
 def test_half_alert_ignores_outside_window_and_status():
-    assert la.build_half_alert(total_item(1, 60, 40, minute=59), ex({10: 80, 20: 20}), {}) is None
+    assert la.build_half_alert(total_item(1, 60, 40, minute=64), ex({10: 80, 20: 20}), {}) is None
     assert la.build_half_alert(total_item(1, 60, 40, minute=76), ex({10: 80, 20: 20}), {}) is None
     item = total_item(1, 60, 40)
     item["fixture"]["status"]["short"] = "HT"
@@ -229,3 +229,17 @@ def test_dry_run_half_does_not_record(tmp_path, conn):
 def _legacy_categories_enabled(monkeypatch):
     """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
     monkeypatch.setattr(la, "ENABLED_CATEGORIES", la.LEGACY_CATEGORIES)
+
+
+@pytest.mark.parametrize("goals,expected", [((0, 1), True), ((1, 1), True), ((2, 1), True), ((3, 1), False), ((2, 0), False)])
+def test_leader_by_more_than_one_goal_is_excluded(goals, expected):
+    item = total_item(1, 60, 40)
+    item["goals"] = {"home": goals[0], "away": goals[1]}
+    alert = la.build_half_alert(item, ex({10: 75, 20: 25}), {})
+    assert (alert is not None) == expected
+
+
+def test_minute_window_65_to_75_for_half():
+    for minute, expected in ((64, False), (65, True), (75, True)):
+        alert = la.build_half_alert(total_item(1, 60, 40, minute=minute), ex({10: 75, 20: 25}), {})
+        assert (alert is not None) == expected
