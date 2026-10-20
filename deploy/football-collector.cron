@@ -56,3 +56,12 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 7    * * *  deploy  /opt/apps/football-collector/deploy/check_backup.sh /opt/apps/football-db/backups
 */10 * * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
 */30 *      * * *  deploy  /opt/apps/football-collector/deploy/run_settle_bets.sh
+
+# basketball — сбор баскетбола (specs/баскетбол-сбор-данных.md): схема basketball, свой лимит API
+# (75 000 в сутки, отдельный от футбольного). Время МСК. Каталог по понедельникам; списки игр активных
+# сезонов ежедневно; статистика команд и игроков от свежих месяцев к старым (до 50 000 запросов в сутки);
+# снимки коэффициентов Pinnacle и 1xBet два раза в сутки (03:00 и 15:00 МСК = 00:00 и 12:00 UTC).
+30 8   * * 1  deploy  /opt/apps/football-collector/deploy/run_basketball.sh catalog 10
+0 11   * * *  deploy  /opt/apps/football-collector/deploy/run_basketball.sh games 3000
+10 11  * * *  deploy  /opt/apps/football-collector/deploy/run_basketball.sh stats 50000
+0 3,15 * * *  deploy  /opt/apps/football-collector/deploy/run_basketball.sh odds 2000

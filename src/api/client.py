@@ -105,6 +105,7 @@ class ApiClient:
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], float] = time.time
     verbose: bool = True
+    base_url: str = BASE_URL
 
     requests_used: int = field(default=0, init=False)
     daily_remaining: str | None = field(default=None, init=False)
@@ -205,7 +206,7 @@ class ApiClient:
                 print(f"  ~ кэш не записан ({type(error).__name__}): {endpoint}")
 
     def _fetch_with_retries(self, endpoint: str, params: dict) -> dict | None:
-        url = f"{BASE_URL}{endpoint}"
+        url = f"{self.base_url}{endpoint}"
         if params:
             url += f"?{urllib.parse.urlencode(params)}"
         headers = {"x-apisports-key": self.key}
