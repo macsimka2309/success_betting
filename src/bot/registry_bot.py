@@ -39,6 +39,8 @@ REPORT_KEYBOARD = {
 NUMBER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 INTEGER = re.compile(r"^[0-9]{1,9}$")
 QUARTER = Decimal("0.25")
+STAKE = Decimal("1.00")  # ставка всегда 1 у. е. (с 20.10.2026)
+BET_BUTTON = re.compile(r"^bet:([0-9]{1,9}):(TB|TM):([0-9]{1,2}\.[0-9])$")
 
 
 def parse_number(text: str) -> Decimal | None:
@@ -192,8 +194,6 @@ class Bot:
             self.api.send(self.owner, "Выберите рынок кнопкой: ТБ или ТМ", MARKET_KEYBOARD)
         elif step == "line":
             self._step_line(text, payload)
-        elif step == "amount":
-            self._step_amount(text, payload)
         elif step == "odds":
             self._step_odds(text, payload, update_id)
         else:
@@ -222,15 +222,7 @@ class Bot:
         if value is None or value % QUARTER != 0 or not (QUARTER <= value <= 20):
             self.api.send(self.owner, "Линия — число, кратное 0.25, от 0.25 до 20, например 2.5. Введите число")
             return
-        self._set_dialog("amount", {**payload, "line": str(value.quantize(Decimal("0.01")))})
-        self.api.send(self.owner, "Введите сумму ставки")
-
-    def _step_amount(self, text: str, payload: dict) -> None:
-        value = parse_number(text)
-        if value is None or not (0 < value <= 1_000_000):
-            self.api.send(self.owner, "Сумма — положительное число, не больше 1000000. Введите сумму ставки")
-            return
-        self._set_dialog("odds", {**payload, "amount": str(value.quantize(Decimal("0.01"), ROUND_HALF_UP))})
+        self._set_dialog("odds", {**payload, "line": str(value.quantize(Decimal("0.01")))})
         self.api.send(self.owner, "Введите коэффициент")
 
     def _step_odds(self, text: str, payload: dict, update_id: int | None) -> None:
@@ -245,16 +237,37 @@ class Bot:
                     """INSERT INTO bets (alert_id, fixture_id, market, line, odds, stake, kickoff_at)
                        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING bet_id""",
                     (payload["alert_id"], payload["fixture_id"], payload["market"], payload["line"], odds,
-                     payload["amount"], payload.get("kickoff_at")),
+                     STAKE, payload.get("kickoff_at")),
                 )
                 bet_id = cur.fetchone()[0]
             self._set_dialog(None, {}, update_id)
         self.api.send(
             self.owner,
             f"Записано: ставка №{bet_id}, оповещение {payload['alert_id']}, {MARKET_TITLES[payload['market']]} "
-            f"{payload['line']}, сумма {payload['amount']}, кф {odds}",
+            f"{payload['line']}, ставка 1, кф {odds}",
             MENU,
         )
+
+    def _on_bet_button(self, match: re.Match) -> None:
+        """Кнопка под оповещением: рынок и линия известны, остаётся коэффициент."""
+        alert_id, market, line = int(match.group(1)), match.group(2), Decimal(match.group(3))
+        if line % QUARTER != 0 or not (QUARTER <= line <= 20):
+            self.api.send(self.owner, "Начните с меню", MENU)
+            return
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT fixture_id, home_name, away_name, kickoff_at FROM live_alerts_sent WHERE alert_id = %s",
+                (alert_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            self.api.send(self.owner, "Такого оповещения нет", MENU)
+            return
+        fixture_id, home, away, kickoff = row
+        payload = {"alert_id": alert_id, "fixture_id": fixture_id, "market": market,
+                   "line": str(line.quantize(Decimal("0.01"))), "kickoff_at": kickoff.isoformat() if kickoff else None}
+        self._set_dialog("odds", payload)
+        self.api.send(self.owner, f"{home} — {away}: {MARKET_TITLES[market]} {line}, ставка 1. Введите коэффициент")
 
     # ---- кнопки
     def _on_callback(self, callback: dict, update_id: int | None) -> None:
@@ -270,6 +283,8 @@ class Bot:
         elif data.startswith("mkt:") and step == "market" and data[4:] in ALLOWED_MARKETS:
             self._set_dialog("line", {**payload, "market": data[4:]})
             self.api.send(self.owner, "Введите число (линия), например 2.5")
+        elif BET_BUTTON.match(data):
+            self._on_bet_button(BET_BUTTON.match(data))
         elif data in ("rep:day", "rep:month"):
             mode = data[4:]
             self.api.send(self.owner, format_report(report_rows(self.conn, mode), mode), html=True)

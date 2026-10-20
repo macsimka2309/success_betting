@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -49,7 +50,7 @@ CATEGORY_TITLES = {
     "favorite": "фаворит дома против аутсайдера",
 }
 
-Sender = Callable[[str], None]
+Sender = Callable[..., None]  # send(text, reply_markup=None)
 
 
 class TelegramError(RuntimeError):
@@ -80,6 +81,11 @@ class Alert:
     teams_count: int | None = None
     home_points: int | None = None  # только для сообщения, в базе не хранятся
     away_points: int | None = None
+    extra: tuple = ()  # другие признаки того же матча в этой карточке (Alert)
+
+    @property
+    def categories(self) -> tuple[str, ...]:
+        return (self.category,) + tuple(a.category for a in self.extra)
 
     @property
     def team(self) -> str:
@@ -157,30 +163,52 @@ def build_alert(item: dict) -> Alert | None:
     return None
 
 
-def format_message(alert: Alert) -> str:
-    header = f"ID: {alert.alert_id}\n" if alert.alert_id is not None else "ID: (dry-run)\n"
-    role = "хозяева" if alert.team_side == "home" else "гости"
-    lines = [
-        f"{header}Тип: {CATEGORY_TITLES[alert.category]}",
-        f"Лига: {alert.league} ({alert.country})",
-        f"Матч: {alert.home} — {alert.away}",
-        f"Минута: {alert.minute}' | Счёт: {alert.goals_home}:{alert.goals_away}",
-        f"Команда: {alert.team} ({role})",
-    ]
+def _detail_lines(alert: Alert) -> list[str]:
     if alert.category == "favorite":
-        lines[4] = f"Фаворит: {alert.home} — {alert.home_rank}-е место из {alert.teams_count}, {alert.home_points} оч."
-        lines.append(f"Аутсайдер: {alert.away} — {alert.away_rank}-е место, {alert.away_points} оч.")
-    elif alert.category == "half":
+        return [f"Фаворит: {alert.home} — {alert.home_rank}-е место из {alert.teams_count}, {alert.home_points} оч.",
+                f"Аутсайдер: {alert.away} — {alert.away_rank}-е место, {alert.away_points} оч."]
+    role = "хозяева" if alert.team_side == "home" else "гости"
+    lines = [f"Команда: {alert.team} ({role})"]
+    opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
+    if alert.category == "half":
         total = f" (за матч {alert.total_possession} %)" if alert.total_possession is not None else ""
         lines.append(f"Владение во 2-м тайме: {alert.possession} %{total}")
     elif alert.category == "half_attack":
-        opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
         lines.append(f"Во 2-м тайме: владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opponent})")
     else:
-        opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
         lines.append(f"Владение: {alert.possession} %")
         lines.append(f"Удары в створ: {alert.shots} против {opponent}")
+    return lines
+
+
+def format_message(alert: Alert) -> str:
+    header = f"ID: {alert.alert_id}\n" if alert.alert_id is not None else "ID: (dry-run)\n"
+    common = [
+        f"Лига: {alert.league} ({alert.country})",
+        f"Матч: {alert.home} — {alert.away}",
+        f"Минута: {alert.minute}' | Счёт: {alert.goals_home}:{alert.goals_away}",
+    ]
+    if not alert.extra:
+        return "\n".join([f"{header}Тип: {CATEGORY_TITLES[alert.category]}"] + common + _detail_lines(alert))
+    cards = (alert,) + tuple(alert.extra)
+    lines = [f"{header}Признаки ({len(cards)}):"] + [f"• {CATEGORY_TITLES[a.category]}" for a in cards] + common
+    for card in cards:
+        lines.append(f"— {CATEGORY_TITLES[card.category]}:")
+        lines += _detail_lines(card)
     return "\n".join(lines)
+
+
+def bet_keyboard(alert: Alert) -> dict | None:
+    """Кнопки ставок: ТБ и ТМ на «голы сейчас + 0,5» и «голы сейчас + 1,5» (callback `bet:ID:РЫНОК:ЛИНИЯ`)."""
+    if alert.alert_id is None:
+        return None
+    goals = alert.goals_home + alert.goals_away
+    rows = []
+    for shift in (0.5, 1.5):
+        line = f"{goals + shift:.1f}"
+        rows.append([{"text": f"{title} {line}", "callback_data": f"bet:{alert.alert_id}:{code}:{line}"}
+                     for code, title in (("TB", "ТБ"), ("TM", "ТМ"))])
+    return {"inline_keyboard": rows}
 
 
 # ------------------------------------------------------------------ Telegram
@@ -190,7 +218,8 @@ def _curl_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def telegram_curl_request(token: str, chat_id: str, text: str, proxy: str | None, timeout: int = 15):
+def telegram_curl_request(token: str, chat_id: str, text: str, proxy: str | None, timeout: int = 15,
+                          reply_markup: dict | None = None):
     """Аргументы curl и конфиг для stdin. Токен только в конфиге: в argv его видно в `ps`."""
     argv = ["curl", "-sS", "-m", str(timeout), "-o", "/dev/null", "-w", "%{http_code}", "-K", "-"]
     if proxy:
@@ -200,6 +229,8 @@ def telegram_curl_request(token: str, chat_id: str, text: str, proxy: str | None
         f'data-urlencode = "chat_id={_curl_quote(chat_id)}"\n'
         f'data-urlencode = "text={_curl_quote(text)}"\n'
     )
+    if reply_markup is not None:
+        config += f'data-urlencode = "reply_markup={_curl_quote(json.dumps(reply_markup, ensure_ascii=False))}"\n'
     return argv, config
 
 
@@ -210,8 +241,8 @@ def telegram_sender_from_env() -> Sender:
     if not token or not chat_id:
         raise SystemExit("Не заданы TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env")
 
-    def send(text: str) -> None:
-        argv, config = telegram_curl_request(token, chat_id, text, proxy)
+    def send(text: str, reply_markup: dict | None = None) -> None:
+        argv, config = telegram_curl_request(token, chat_id, text, proxy, reply_markup=reply_markup)
         try:
             result = subprocess.run(argv, input=config, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
@@ -419,8 +450,8 @@ def _already_sent(conn, fixture_ids: list[int], category: str) -> set[int]:
         return set()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT fixture_id FROM live_alerts_sent WHERE fixture_id = ANY(%s) AND category = %s",
-            (fixture_ids, category),
+            "SELECT fixture_id FROM live_alerts_sent WHERE fixture_id = ANY(%s) AND (category = %s OR %s = ANY(also_categories))",
+            (fixture_ids, category, category),
         )
         return {row[0] for row in cur.fetchall()}
 
@@ -437,13 +468,13 @@ def _record_sent(conn, alert: Alert) -> None:
         cur.execute(
             """INSERT INTO live_alerts_sent (alert_id, fixture_id, category, league_id, home_name, away_name,
                    minute, goals_home, goals_away, team_side, possession, shots_on_goal, opponent_shots_on_goal,
-                   total_possession, kickoff_at, home_rank, away_rank, teams_count)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   total_possession, kickoff_at, home_rank, away_rank, teams_count, also_categories)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (fixture_id, category) DO NOTHING""",
             (alert.alert_id, alert.fixture_id, alert.category, alert.league_id, alert.home, alert.away,
              alert.minute, alert.goals_home, alert.goals_away, alert.team_side, alert.possession, alert.shots,
              alert.opponent_shots, alert.total_possession, alert.kickoff_at,
-             alert.home_rank, alert.away_rank, alert.teams_count),
+             alert.home_rank, alert.away_rank, alert.teams_count, list(alert.categories[1:])),
         )
 
 
@@ -514,7 +545,7 @@ def run_live_alerts(
                 return True
             alert = replace(alert, alert_id=_reserve_alert_id(conn))
             try:
-                send(format_message(alert))  # type: ignore[misc]
+                send(format_message(alert), bet_keyboard(alert))  # type: ignore[misc]
             except TelegramError as exc:
                 log(f"оповещение по матчу {alert.fixture_id} не отправлено: {exc}")
                 failed_sends += 1
@@ -522,6 +553,17 @@ def run_live_alerts(
             _record_sent(conn, alert)
             ctx.items_processed += 1
             return True
+
+        pending_cards: dict[int, list[Alert]] = {}
+
+        def collect(alert: Alert) -> bool:
+            """Признаки одного матча за запуск собираются в одну карточку."""
+            pending_cards.setdefault(alert.fixture_id, []).append(alert)
+            return True
+
+        def flush() -> None:
+            for alerts in pending_cards.values():
+                deliver(replace(alerts[0], extra=tuple(alerts[1:])))
 
         live = client.get("/fixtures", {"live": "all"}, use_cache=False)
         if live is None or live.get("errors"):
@@ -546,7 +588,7 @@ def run_live_alerts(
                     tables[(league_id, season)] = load_table(conn, league_id, season)
                 alert = build_favorite_alert(item, tables[(league_id, season)], types.get(league_id))
                 if alert is not None:
-                    deliver(alert)
+                    collect(alert)
 
         if legacy:
             # Владение на перерыве: итог на перерыве равен первому тайму.
@@ -577,7 +619,7 @@ def run_live_alerts(
                 if on["stats"] and fixture_id not in sent["stats"]:
                     alert = build_alert(item)
                     if alert is not None:
-                        fired = deliver(alert) or fired
+                        fired = collect(alert) or fired
                 if second_half_pending(fixture_id) and is_candidate(item):
                     minute = _score_and_minute(item)[0]  # type: ignore[index]
                     total = _possession_by_side(item)
@@ -601,13 +643,14 @@ def run_live_alerts(
                         if want_half:
                             alert = build_half_alert(item, exact, total)
                             if alert is not None:
-                                fired = deliver(alert) or fired
+                                fired = collect(alert) or fired
                         if want_attack:
                             alert = build_attack_alert(item, exact, total)
                             if alert is not None:
-                                fired = deliver(alert) or fired
+                                fired = collect(alert) or fired
                 if not fired:
                     ctx.skipped += 1
+        flush()
         if failed_sends:
             raise RuntimeError(f"не отправлено оповещений: {failed_sends}")
     return ctx

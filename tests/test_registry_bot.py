@@ -80,9 +80,9 @@ def bets(conn):
 
 def test_full_dialog_creates_bet(env):
     bot, api, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "1.5", "250", "1.85")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "1.5", "1.85")
 
-    assert bets(conn) == [(alert_id, 500, "TB", D("1.50"), D("250.00"), D("1.850"), "open")]
+    assert bets(conn) == [(alert_id, 500, "TB", D("1.50"), D("1.00"), D("1.850"), "open")]
     assert "Записано" in api.last and "ТБ" in api.last and "1.50" in api.last
     with conn.cursor() as cur:
         cur.execute("SELECT kickoff_at IS NOT NULL FROM bets")
@@ -98,22 +98,20 @@ def test_prompts_in_order(env):
     feed(bot, up, "@mkt:TB")
     assert "линия" in api.last
     feed(bot, up, "2.5")
-    assert "сумму" in api.last
-    feed(bot, up, "100")
     assert "коэффициент" in api.last
 
 
 def test_comma_decimal_is_accepted(env):
     bot, _, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2,5", "100,50", "1,9")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2,5", "1,9")
 
-    assert bets(conn)[0][3:6] == (D("2.50"), D("100.50"), D("1.900"))
+    assert bets(conn)[0][3:6] == (D("2.50"), D("1.00"), D("1.900"))
 
 
 def test_several_bets_on_one_alert(env):
     bot, _, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", "100", "1.9",
-         rb.MENU_ADD, str(alert_id), "@mkt:TB", "0.5", "50", "1.5")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", "1.9",
+         rb.MENU_ADD, str(alert_id), "@mkt:TB", "0.5", "1.5")
 
     assert len(bets(conn)) == 2
 
@@ -141,26 +139,19 @@ def test_bad_line_asks_again(env, bad):
     assert "кратное 0.25" in api.last and bets(conn) == []
 
 
-@pytest.mark.parametrize("bad", ["0", "-5", "abc", "1000001", "nan"])
-def test_bad_amount_asks_again(env, bad):
-    bot, api, up, _, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", bad)
-    assert "Сумма" in api.last
-
-
 @pytest.mark.parametrize("bad", ["1", "0.9", "1001", "abc"])
 def test_bad_odds_asks_again(env, bad):
     bot, api, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", "100", bad)
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", bad)
     assert "Коэффициент" in api.last and bets(conn) == []
 
 
 def test_boundary_values_accepted(env):
     bot, _, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "0.25", "1000000", "1.001",
-         rb.MENU_ADD, str(alert_id), "@mkt:TB", "20", "0.01", "1000")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "0.25", "1.001",
+         rb.MENU_ADD, str(alert_id), "@mkt:TB", "20", "1000")
 
-    assert [b[3:6] for b in bets(conn)] == [(D("0.25"), D("1000000.00"), D("1.001")), (D("20.00"), D("0.01"), D("1000.000"))]
+    assert [b[3:6] for b in bets(conn)] == [(D("0.25"), D("1.00"), D("1.001")), (D("20.00"), D("1.00"), D("1000.000"))]
 
 
 def test_only_total_markets_are_offered(env):
@@ -170,9 +161,9 @@ def test_only_total_markets_are_offered(env):
 
 def test_total_under_dialog_creates_tm_bet(env):
     bot, api, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TM", "2.5", "100", "1.9")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TM", "2.5", "1.9")
 
-    assert bets(conn) == [(alert_id, 500, "TM", D("2.50"), D("100.00"), D("1.900"), "open")]
+    assert bets(conn) == [(alert_id, 500, "TM", D("2.50"), D("1.00"), D("1.900"), "open")]
     assert "ТМ" in api.last
 
 
@@ -235,7 +226,6 @@ def test_dialog_survives_restart(env):
     feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5")
     restarted = rb.Bot(api, conn, OWNER, log=lambda _: None)
 
-    restarted.handle_update(up.text("100"))
     restarted.handle_update(up.text("1.9"))
 
     assert len(bets(conn)) == 1
@@ -243,7 +233,7 @@ def test_dialog_survives_restart(env):
 
 def test_redelivered_update_is_ignored(env):
     bot, api, up, conn, alert_id = env
-    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5", "100")
+    feed(bot, up, rb.MENU_ADD, str(alert_id), "@mkt:TB", "2.5")
     final = up.text("1.9")
     bot.handle_update(final)
     bot.handle_update(final)  # Telegram прислал то же обновление ещё раз
@@ -364,3 +354,34 @@ def test_parse_number():
     assert rb.parse_number(" 10 ") == D(10)
     for bad in ("1e3", "-1", "nan", "inf", "", "1.2.3", "٣"):
         assert rb.parse_number(bad) is None
+
+
+# ------------------------------------------------------------ кнопки под оповещением
+
+
+def test_alert_button_asks_only_for_odds_and_stakes_one(env):
+    bot, api, up, conn, alert_id = env
+    feed(bot, up, f"@bet:{alert_id}:TB:2.5")
+    assert "коэффициент" in api.last and "Home FC — Away FC" in api.last and "ТБ 2.5" in api.last
+    feed(bot, up, "1,8")
+
+    assert bets(conn) == [(alert_id, 500, "TB", D("2.50"), D("1.00"), D("1.800"), "open")]
+
+
+def test_alert_button_under_market(env):
+    bot, _, up, conn, alert_id = env
+    feed(bot, up, f"@bet:{alert_id}:TM:3.5", "2.1")
+    assert bets(conn)[0][2:4] == ("TM", D("3.50"))
+
+
+@pytest.mark.parametrize("tail", ["TB:2.3", "TB:0.0", "ITB1:2.5", "XX:2.5"])
+def test_bad_alert_buttons_are_rejected(env, tail):
+    bot, _, up, conn, alert_id = env
+    feed(bot, up, f"@bet:{alert_id}:{tail}", "1.9")
+    assert bets(conn) == []
+
+
+def test_alert_button_for_unknown_alert(env):
+    bot, api, up, conn, _ = env
+    feed(bot, up, "@bet:99999:TB:2.5", "1.9")
+    assert "нет" in api.sent[-2][1] and bets(conn) == []

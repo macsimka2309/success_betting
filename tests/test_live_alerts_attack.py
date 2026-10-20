@@ -151,8 +151,8 @@ def test_one_exact_request_serves_both_second_half_categories(tmp_path, conn):
     client, outbox, _ = run(tmp_path, conn, bodies)
 
     assert client.requests_used == 3  # live, ids, один точный запрос на обе категории
-    titles = sorted(m.splitlines()[1] for m in outbox.messages)
-    assert titles == ["Тип: атака во 2-м тайме", "Тип: владение во 2-м тайме"]
+    assert len(outbox.messages) == 1
+    assert "• атака во 2-м тайме" in outbox.messages[0] and "• владение во 2-м тайме" in outbox.messages[0]
 
 
 def test_attack_alert_not_repeated(tmp_path, conn):

@@ -51,13 +51,15 @@ def detail_item(fid, possession="58%", shots_home=7, shots_away=2, away_possessi
 class Outbox:
     def __init__(self, fail_times=0):
         self.messages = []
+        self.markups = []
         self.fail_times = fail_times
 
-    def __call__(self, text):
+    def __call__(self, text, reply_markup=None):
         if self.fail_times:
             self.fail_times -= 1
             raise la.TelegramError("HTTP 500")
         self.messages.append(text)
+        self.markups.append(reply_markup)
 
 
 def run(tmp_path, conn, bodies, outbox=None, **kwargs):

@@ -189,19 +189,18 @@ def test_half_alert_not_repeated(tmp_path, conn):
     assert outbox.messages == [] and client.requests_used == 2
 
 
-def test_both_categories_fire_on_one_match_with_different_ids(tmp_path, conn):
+def test_both_categories_fire_on_one_match_in_one_card(tmp_path, conn):
     seed_snapshot(conn, 1, 50, 50)
     item = detail_item(1, possession="62%", away_possession="38%", shots_home=7, shots_away=1, home=0, away=0)
     bodies = [{"response": [live_item(1, home=0, away=0)]}, {"response": [item]}, exact_body("75%", "25%")]
     _, outbox, _ = run(tmp_path, conn, bodies)
 
-    assert len(outbox.messages) == 2
-    ids = [m.splitlines()[0] for m in outbox.messages]
-    assert len(set(ids)) == 2
-    assert {"владение и удары в створ", "владение во 2-м тайме"} == {m.splitlines()[1].removeprefix("Тип: ") for m in outbox.messages}
+    assert len(outbox.messages) == 1
+    text = outbox.messages[0]
+    assert "Признаки (2):" in text and "• владение и удары в створ" in text and "• владение во 2-м тайме" in text
     with conn.cursor() as cur:
-        cur.execute("SELECT category FROM live_alerts_sent ORDER BY alert_id")
-        assert cur.fetchall() == [("stats",), ("half",)]
+        cur.execute("SELECT category, also_categories FROM live_alerts_sent")
+        assert cur.fetchall() == [("stats", ["half"])]
 
 
 def test_exact_request_respects_budget(tmp_path, conn):
