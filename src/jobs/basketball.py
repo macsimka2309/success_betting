@@ -311,13 +311,15 @@ def _store_games(conn, items: list) -> tuple[int, int]:
         games.append(game)
     if not games:
         return 0, skipped
-    for game in games:
-        write_row(conn, "basketball.leagues", ["league_id", "name", "type"],
-                  (game["league_id"], game["_league_name"] or f"Лига {game['league_id']}", game["_league_type"]),
-                  "league_id", update_columns=[])
-        for team_id, name in ((game["home_team_id"], game["_home_name"]), (game["away_team_id"], game["_away_name"])):
-            write_row(conn, "basketball.teams", ["team_id", "name"], (team_id, name or f"Команда {team_id}"),
-                      "team_id")
+    leagues = {g["league_id"]: (g["league_id"], g["_league_name"] or f"Лига {g['league_id']}", g["_league_type"])
+               for g in games}
+    write_batch(conn, "basketball.leagues", ["league_id", "name", "type"], list(leagues.values()), "league_id",
+                update_columns=[])
+    teams: dict[int, tuple] = {}
+    for g in games:
+        teams[g["home_team_id"]] = (g["home_team_id"], g["_home_name"] or f"Команда {g['home_team_id']}")
+        teams[g["away_team_id"]] = (g["away_team_id"], g["_away_name"] or f"Команда {g['away_team_id']}")
+    write_batch(conn, "basketball.teams", ["team_id", "name"], list(teams.values()), "team_id")
     write_batch(conn, "basketball.games", list(GAME_COLUMNS), [tuple(g[c] for c in GAME_COLUMNS) for g in games],
                 "game_id")
     return len(games), skipped
