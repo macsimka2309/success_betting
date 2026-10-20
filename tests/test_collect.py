@@ -72,6 +72,7 @@ def conn():
     with psycopg.connect(TEST_URL, autocommit=True) as connection:
         with connection.cursor() as cur:
             cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS basketball CASCADE")
             cur.execute("CREATE SCHEMA public")
         migrate.run_up(connection)
         yield connection

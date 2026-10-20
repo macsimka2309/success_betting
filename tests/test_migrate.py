@@ -28,6 +28,7 @@ def conn():
     with psycopg.connect(TEST_URL) as connection:
         with connection.cursor() as cur:
             cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS basketball CASCADE")
             cur.execute("CREATE SCHEMA public")
         connection.commit()
         yield connection
@@ -82,12 +83,16 @@ def test_up_is_idempotent(conn):
 
 
 def test_down_then_up_again(conn):
+    """Откат всех миграций по очереди, от последней к первой.
+
+    Версии не хардкодятся (кроме "001" как границы) — список берётся из
+    migrate.discover(), чтобы тест не ломался при каждой новой миграции.
+    """
     migrate.run_up(conn)
-    migrate.run_down(conn, "004")
-    assert "fixture_statistics_halves" not in table_names(conn)
-    migrate.run_down(conn, "003")
-    migrate.run_down(conn, "002")
-    migrate.run_down(conn, "001")
+    versions_desc = [m.version for m in reversed(migrate.discover())]
+    assert versions_desc[-1] == "001"
+    for version in versions_desc:
+        migrate.run_down(conn, version)
     assert "fixtures" not in table_names(conn)
     assert migrate.applied_versions(conn) == set()
     migrate.run_up(conn)
@@ -125,3 +130,80 @@ def test_failed_migration_does_not_register(conn):
         assert "999" not in migrate.applied_versions(conn)
     finally:
         broken.path.unlink()
+
+
+# ------------------------------------------------ баскетбольная схема (миграция 016)
+
+
+def bb_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'basketball'")
+        return {row[0] for row in cur.fetchall()}
+
+
+def test_basketball_schema_created_and_isolated(conn):
+    migrate.run_up(conn)
+    assert bb_tables(conn) >= {
+        "leagues", "league_seasons", "teams", "players", "games", "team_game_stats",
+        "player_game_stats", "fetch_state", "bookmakers", "bet_types", "odds_snapshots", "odds_values",
+    }
+    assert "games" not in bb_tables(conn) - {"games"}  # имена не пересекаются с public
+    assert "fixtures" in table_names(conn)  # футбольные таблицы на месте
+
+
+def test_basketball_foreign_keys_and_defaults(conn):
+    migrate.run_up(conn)
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO basketball.leagues (league_id, name) VALUES (12, 'NBA')")
+        cur.execute("INSERT INTO basketball.teams (team_id, name) VALUES (1, 'A'), (2, 'B')")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation), conn.transaction():
+            cur.execute(
+                "INSERT INTO basketball.games (game_id, league_id, season, tip_off, game_date, status_short, "
+                "home_team_id, away_team_id) VALUES (1, 99, '2025-2026', now(), current_date, 'FT', 1, 2)"
+            )
+        cur.execute(
+            "INSERT INTO basketball.games (game_id, league_id, season, tip_off, game_date, status_short, "
+            "home_team_id, away_team_id) VALUES (1, 12, '2025-2026', now(), current_date, 'FT', 1, 2)"
+        )
+        cur.execute("INSERT INTO basketball.team_game_stats (game_id, team_id) VALUES (1, 1)")
+        cur.execute("SELECT fg_attempts, reb_offence FROM basketball.team_game_stats")
+        assert cur.fetchone() == (None, None)  # отсутствие данных — NULL, не ноль
+        cur.execute("INSERT INTO basketball.fetch_state (game_id) VALUES (1)")
+        cur.execute("SELECT team_stats_attempts, player_stats_attempts FROM basketball.fetch_state")
+        assert cur.fetchone() == (0, 0)
+
+
+def test_basketball_odds_key_allows_ladder_of_lines(conn):
+    migrate.run_up(conn)
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO basketball.leagues (league_id, name) VALUES (12, 'NBA')")
+        cur.execute("INSERT INTO basketball.teams (team_id, name) VALUES (1, 'A'), (2, 'B')")
+        cur.execute(
+            "INSERT INTO basketball.games (game_id, league_id, season, tip_off, game_date, status_short, "
+            "home_team_id, away_team_id) VALUES (1, 12, '2025-2026', now(), current_date, 'NS', 1, 2)"
+        )
+        cur.execute("INSERT INTO basketball.bookmakers VALUES (4, 'Pinnacle')")
+        cur.execute("INSERT INTO basketball.bet_types VALUES (2, 'Over/Under')")
+        cur.execute("INSERT INTO basketball.odds_snapshots (game_id) VALUES (1) RETURNING snapshot_id")
+        snap = cur.fetchone()[0]
+        for outcome, line in (("Over", 219.5), ("Over", 220.0), ("Under", 219.5)):
+            cur.execute(
+                "INSERT INTO basketball.odds_values (snapshot_id, bookmaker_id, bet_type_id, outcome, line, odd) "
+                "VALUES (%s, 4, 2, %s, %s, 1.9)", (snap, outcome, line),
+            )
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            cur.execute(
+                "INSERT INTO basketball.odds_values (snapshot_id, bookmaker_id, bet_type_id, outcome, line, odd) "
+                "VALUES (%s, 4, 2, 'Over', 219.5, 1.8)", (snap,),
+            )
+
+
+def test_basketball_down_drops_only_its_schema(conn):
+    migrate.run_up(conn)
+    migrate.run_down(conn, max(m.version for m in migrate.discover()))
+    # откат последней миграции; для 016 проверяем отдельно, когда она последняя
+    versions = {m.version for m in migrate.discover()}
+    if "016" in versions and "016" in migrate.applied_versions(conn):
+        migrate.run_down(conn, "016")
+    assert "games" not in bb_tables(conn)
+    assert "fixtures" in table_names(conn)

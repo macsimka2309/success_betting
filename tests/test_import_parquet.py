@@ -168,6 +168,7 @@ def conn():
     with psycopg.connect(TEST_URL) as connection:
         with connection.cursor() as cur:
             cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS basketball CASCADE")
             cur.execute("CREATE SCHEMA public")
         connection.commit()
         migrate.run_up(connection)
@@ -340,6 +341,7 @@ def test_batches_are_committed_during_import(source):
     with psycopg.connect(TEST_URL) as setup:
         with setup.cursor() as cur:
             cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS basketball CASCADE")
             cur.execute("CREATE SCHEMA public")
         setup.commit()
         migrate.run_up(setup)
