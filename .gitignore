@@ -16,3 +16,8 @@ build/
 # Артефакты обучения модели (specs/модель-предсказаний.md) — воспроизводимы
 # запуском src/model/train.py, не коммитятся
 models/
+
+# Разведочные выгрузки (specs/разведочный-анализ-поздних-голов.md) —
+# воспроизводимы src/jobs/build_late_goal_features.py и scan_goal_after_cutoff.py,
+# не коммитятся (71М+ CSV)
+exports/
