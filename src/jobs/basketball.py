@@ -38,6 +38,18 @@ ODDS_HORIZON_HOURS = 36
 # ------------------------------------------------------------------ разбор
 
 
+SMALLINT_MAX = 32767
+
+
+def to_small(value) -> int | None:
+    """Целое для колонки SMALLINT. Значение вне диапазона — ошибка источника (замечено:
+    1 464 578 попыток бросков в одной игре) — хранится как NULL, чтобы не ронять загрузку."""
+    number = to_int(value)
+    if number is None or abs(number) > SMALLINT_MAX:
+        return None
+    return number
+
+
 def season_year(season: str) -> int:
     """`2025-2026` и `2025` -> 2025."""
     return int(str(season)[:4])
@@ -111,7 +123,7 @@ def parse_game(item: dict) -> dict | None:
 
     def side(name: str) -> list[int | None]:
         score = scores.get(name) or {}
-        return [to_int(score.get(k)) for k in ("quarter_1", "quarter_2", "quarter_3", "quarter_4", "over_time", "total")]
+        return [to_small(score.get(k)) for k in ("quarter_1", "quarter_2", "quarter_3", "quarter_4", "over_time", "total")]
 
     row = {
         "game_id": game_id,
@@ -139,7 +151,7 @@ def parse_game(item: dict) -> dict | None:
 
 def _shot(entry: dict, key: str) -> tuple[int | None, int | None]:
     block = entry.get(key) or {}
-    return to_int(block.get("total")), to_int(block.get("attempts"))
+    return to_small(block.get("total")), to_small(block.get("attempts"))
 
 
 TEAM_STAT_COLUMNS = (
@@ -156,10 +168,10 @@ def parse_team_stats(entry: dict) -> dict:
     return {
         "fg_made": fg[0], "fg_attempts": fg[1], "three_made": three[0], "three_attempts": three[1],
         "ft_made": ft[0], "ft_attempts": ft[1],
-        "reb_total": to_int(reb.get("total")), "reb_offence": to_int(reb.get("offence")),
-        "reb_defense": to_int(reb.get("defense")), "assists": to_int(entry.get("assists")),
-        "steals": to_int(entry.get("steals")), "blocks": to_int(entry.get("blocks")),
-        "turnovers": to_int(entry.get("turnovers")), "personal_fouls": to_int(entry.get("personal_fouls")),
+        "reb_total": to_small(reb.get("total")), "reb_offence": to_small(reb.get("offence")),
+        "reb_defense": to_small(reb.get("defense")), "assists": to_small(entry.get("assists")),
+        "steals": to_small(entry.get("steals")), "blocks": to_small(entry.get("blocks")),
+        "turnovers": to_small(entry.get("turnovers")), "personal_fouls": to_small(entry.get("personal_fouls")),
     }
 
 
@@ -177,11 +189,11 @@ def parse_player_stats(entry: dict) -> dict:
     return {
         "is_starter": None if kind is None else kind == "starters",
         "seconds_played": parse_minutes(entry.get("minutes")),
-        "points": to_int(entry.get("points")),
+        "points": to_small(entry.get("points")),
         "fg_made": fg[0], "fg_attempts": fg[1], "three_made": three[0], "three_attempts": three[1],
         "ft_made": ft[0], "ft_attempts": ft[1],
-        "reb_total": to_int((entry.get("rebounds") or {}).get("total")),
-        "assists": to_int(entry.get("assists")),
+        "reb_total": to_small((entry.get("rebounds") or {}).get("total")),
+        "assists": to_small(entry.get("assists")),
     }
 
 

@@ -101,6 +101,19 @@ def test_parse_team_stats_keeps_missing_fields_null():
     assert stats["reb_defense"] is None and stats["personal_fouls"] is None  # NULL, не ноль
 
 
+def test_values_beyond_smallint_become_null_not_a_crash():
+    """Ошибка источника: 464 578 попыток бросков в одной игре роняла загрузку (smallint out of range)."""
+    entry = team_entry(1, fga=464578)
+    stats = bb.parse_team_stats(entry)
+    assert stats["fg_attempts"] is None and stats["fg_made"] == 40
+    player = player_entry(1, 7)
+    player["points"] = 100000
+    assert bb.parse_player_stats(player)["points"] is None
+    game = bb.parse_game(game_item(hs=(25, 20, 30, 25, None, 999999)))
+    assert game["home_total"] is None and game["home_q1"] == 25
+    assert bb.to_small(32767) == 32767 and bb.to_small(32768) is None and bb.to_small("x") is None
+
+
 def test_parse_player_stats_starter_and_minutes():
     stats = bb.parse_player_stats(player_entry(1, 7, minutes="10:35", kind="bench"))
     assert stats["is_starter"] is False and stats["seconds_played"] == 635 and stats["points"] == 14
