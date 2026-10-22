@@ -385,3 +385,8 @@ def test_alert_button_for_unknown_alert(env):
     bot, api, up, conn, _ = env
     feed(bot, up, "@bet:99999:TB:2.5", "1.9")
     assert "нет" in api.sent[-2][1] and bets(conn) == []
+
+
+def test_menu_has_no_add_button():
+    texts = [b["text"] for row in rb.MENU["keyboard"] for b in row]
+    assert texts == [rb.MENU_REPORT, rb.MENU_HITS]

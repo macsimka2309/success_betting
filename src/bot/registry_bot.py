@@ -23,7 +23,9 @@ MENU_HITS = "Проходимость"
 CANCEL = "Отмена"
 MARKET_TITLES = {"TB": "ТБ", "TM": "ТМ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}  # названия для записанных ставок
 ALLOWED_MARKETS = ("TB", "TM")  # доступны для выбора; ИТБ1 и ИТБ2 убраны 17.10.2026, ТМ добавлен
-MENU = {"keyboard": [[{"text": MENU_ADD}, {"text": MENU_REPORT}], [{"text": MENU_HITS}]], "resize_keyboard": True}
+# Кнопки «Внести событие» в меню нет с 22.10.2026: ставки вносятся кнопками под оповещением.
+# Текст «Внести событие» и ввод ID по-прежнему работают как запасной путь.
+MENU = {"keyboard": [[{"text": MENU_REPORT}, {"text": MENU_HITS}]], "resize_keyboard": True}
 MARKET_KEYBOARD = {
     "inline_keyboard": [
         [{"text": MARKET_TITLES[code], "callback_data": f"mkt:{code}"} for code in ALLOWED_MARKETS],
