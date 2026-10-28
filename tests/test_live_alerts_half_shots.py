@@ -157,3 +157,7 @@ def test_draw_costs_no_extra_requests(tmp_path, conn):
     draw = live_item(1, minute=70, home=1, away=1)
     client, outbox = run(tmp_path, conn, [{"response": [draw]}])
     assert outbox.messages == [] and client.requests_used == 1
+
+
+def test_only_half_shots_is_enabled_in_production():
+    assert la.ENABLED_CATEGORIES == ("half_shots",)
