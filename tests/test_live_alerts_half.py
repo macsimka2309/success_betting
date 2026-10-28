@@ -227,7 +227,7 @@ def test_dry_run_half_does_not_record(tmp_path, conn):
 @pytest.fixture(autouse=True)
 def _legacy_categories_enabled(monkeypatch):
     """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
-    monkeypatch.setattr(la, "ENABLED_CATEGORIES", la.LEGACY_CATEGORIES)
+    monkeypatch.setattr(la, "ENABLED_CATEGORIES", ("stats", "half", "half_attack"))
 
 
 @pytest.mark.parametrize("goals,expected", [((0, 1), True), ((1, 1), True), ((2, 1), True), ((3, 1), False), ((2, 0), False)])

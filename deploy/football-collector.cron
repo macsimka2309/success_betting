@@ -42,6 +42,8 @@
 # из 600, расчёт ставок ~10, то есть около 6900. Если оповещения вернутся к 650/сутки, снизить daily.
 # 22.10.2026 тариф Ultra (75 000/сутки, до 22.11.2026), по решению владельца daily поднят до 63 000
 # (docs/06, этап 12): 63 000 + оповещения ~650 + коэффициенты 600 + баскетбол отдельным лимитом < 75 000.
+# 28.10.2026 оповещения опрашиваются раз в 5 минут (288 запусков, ожидаемо 500–800 запросов в сутки),
+# при тарифе Ultra бюджет не ограничивает; к 22.11.2026 пересмотреть (на 7 500 нужно daily 5 850).
 # Горизонт дозагрузки — 2018-01-01 (DEFAULT_BACKFILL_SINCE). После окончания очереди вернуть 6200.
 #
 # settle-bets — расчёт результатов ставок из реестра (specs/реестр-ставок.md),
@@ -57,7 +59,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 30 9   * * *  deploy  /opt/apps/football-collector/deploy/run_build_features.sh upcoming
 0 10   * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh international-backfill 300
 0 7    * * *  deploy  /opt/apps/football-collector/deploy/check_backup.sh /opt/apps/football-db/backups
-*/10 * * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
+*/5 * * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh
 */30 *      * * *  deploy  /opt/apps/football-collector/deploy/run_settle_bets.sh
 
 # basketball — сбор баскетбола (specs/баскетбол-сбор-данных.md): схема basketball, свой лимит API

@@ -154,11 +154,11 @@ def test_card_lists_both_features_and_counts_in_both_categories(tmp_path, conn):
     live = item(goals=(0, 1))
     live["teams"]["home"]["id"], live["teams"]["away"]["id"] = 1, 10
     fav = la.build_favorite_alert(live, la.load_table(conn, LEAGUE, SEASON), "League")
-    half = la.build_half_alert(live, {1: {"possession": 74, "shots": None}}, {"home": 60, "away": 40})
+    half = la.build_half_shots_alert(live, {1: {"possession": 74, "shots": 3}}, {"home": 60, "away": 40})
     assert fav is not None and half is not None
     text = la.format_message(la.replace(fav, alert_id=7, extra=(half,)))
-    assert "Признаки (2):" in text and "• фаворит дома против аутсайдера" in text and "• владение во 2-м тайме" in text
-    assert "Владение во 2-м тайме: 74 %" in text and "Аутсайдер: Team 10" in text
+    assert "Признаки (2):" in text and "• фаворит дома против аутсайдера" in text and "• владение и удары во 2-м тайме" in text
+    assert "владение 74 %, удары в створ 3" in text and "Аутсайдер: Team 10" in text
 
 
 def test_two_features_in_one_run_give_one_card_and_dedupe_both(tmp_path, conn):
@@ -166,14 +166,14 @@ def test_two_features_in_one_run_give_one_card_and_dedupe_both(tmp_path, conn):
     live = item(goals=(0, 1))
     live["statistics"] = []
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO live_ht_possession (fixture_id, home_possession, away_possession) VALUES (1, 70, 30)")
+        cur.execute("INSERT INTO live_ht_possession (fixture_id, home_possession, away_possession, home_shots_on_goal, away_shots_on_goal) VALUES (1, 70, 30, 1, 0)")
     live["statistics"] = [
-        {"team": {"id": 1}, "statistics": [{"type": "Ball Possession", "value": "72%"}]},
-        {"team": {"id": 10}, "statistics": [{"type": "Ball Possession", "value": "28%"}]},
+        {"team": {"id": 1}, "statistics": [{"type": "Ball Possession", "value": "72%"}, {"type": "Shots on Goal", "value": 4}]},
+        {"team": {"id": 10}, "statistics": [{"type": "Ball Possession", "value": "28%"}, {"type": "Shots on Goal", "value": 0}]},
     ]
     exact = {"response": [
-        {"team": {"id": 1}, "statistics_2h": [{"type": "Ball Possession", "value": "75%"}]},
-        {"team": {"id": 10}, "statistics_2h": [{"type": "Ball Possession", "value": "25%"}]},
+        {"team": {"id": 1}, "statistics_2h": [{"type": "Ball Possession", "value": "75%"}, {"type": "Shots on Goal", "value": 3}]},
+        {"team": {"id": 10}, "statistics_2h": [{"type": "Ball Possession", "value": "25%"}, {"type": "Shots on Goal", "value": 0}]},
     ]}
     client = make_client(tmp_path, [{"response": [live]}, {"response": [live]}, exact, {"response": [live]}], max_requests=9)
     outbox = Outbox()
@@ -181,6 +181,6 @@ def test_two_features_in_one_run_give_one_card_and_dedupe_both(tmp_path, conn):
     assert len(outbox.messages) == 1 and "Признаки (2):" in outbox.messages[0]
     with conn.cursor() as cur:
         cur.execute("SELECT category, also_categories FROM live_alerts_sent")
-        assert cur.fetchall() == [("favorite", ["half"])]
+        assert cur.fetchall() == [("favorite", ["half_shots"])]
     la.run_live_alerts(client, conn, outbox, log=lambda _: None)  # повтор не дублирует ни один признак
     assert len(outbox.messages) == 1

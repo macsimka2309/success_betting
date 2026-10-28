@@ -171,4 +171,4 @@ def test_attack_alert_not_repeated(tmp_path, conn):
 @pytest.fixture(autouse=True)
 def _legacy_categories_enabled(monkeypatch):
     """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
-    monkeypatch.setattr(la, "ENABLED_CATEGORIES", la.LEGACY_CATEGORIES)
+    monkeypatch.setattr(la, "ENABLED_CATEGORIES", ("stats", "half", "half_attack"))

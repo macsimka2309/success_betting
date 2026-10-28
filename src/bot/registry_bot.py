@@ -95,7 +95,7 @@ def format_report(rows: list[tuple[str, int, Decimal, int]], mode: str) -> str:
     return text
 
 
-HIT_TITLES = {"stats": "Владение+удары", "half": "Владение 2Т>70", "half_attack": "Атака 2Т", "favorite": "Фаворит дома"}
+HIT_TITLES = {"stats": "Владение+удары", "half": "Владение 2Т>70", "half_attack": "Атака 2Т", "favorite": "Фаворит дома", "half_shots": "Влад.+удары 2Т"}
 
 
 def hit_rate_rows(conn) -> list[tuple[str, int, int, int, int]]:
