@@ -19,6 +19,12 @@ pytestmark = pytest.mark.skipif(
 LEAGUE, SEASON, TEAMS = 99, 2026, 10
 
 
+@pytest.fixture(autouse=True)
+def _only_favorite(monkeypatch):
+    """Остальные категории здесь не проверяются: запасная проверка half_shots делает лишние запросы."""
+    monkeypatch.setattr(la, "ENABLED_CATEGORIES", ("favorite",))
+
+
 def seed_table(conn, league_type="League", teams=TEAMS, season=SEASON):
     """Команда с меньшим номером всегда побеждает; место в таблице равно номеру."""
     with conn.cursor() as cur:
@@ -177,10 +183,10 @@ def test_two_features_in_one_run_give_one_card_and_dedupe_both(tmp_path, conn):
     ]}
     client = make_client(tmp_path, [{"response": [live]}, {"response": [live]}, exact, {"response": [live]}], max_requests=9)
     outbox = Outbox()
-    la.run_live_alerts(client, conn, outbox, log=lambda _: None)
+    la.run_live_alerts(client, conn, outbox, log=lambda _: None, categories=("favorite", "half_shots"))
     assert len(outbox.messages) == 1 and "Признаки (2):" in outbox.messages[0]
     with conn.cursor() as cur:
         cur.execute("SELECT category, also_categories FROM live_alerts_sent")
         assert cur.fetchall() == [("favorite", ["half_shots"])]
-    la.run_live_alerts(client, conn, outbox, log=lambda _: None)  # повтор не дублирует ни один признак
+    la.run_live_alerts(client, conn, outbox, log=lambda _: None, categories=("favorite", "half_shots"))  # повтор не дублирует ни один признак
     assert len(outbox.messages) == 1

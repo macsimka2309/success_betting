@@ -30,7 +30,7 @@ SHOTS_ON_GOAL_MIN = 6
 HALF_POSSESSION_MIN = 70  # владение во втором тайме не меньше (с 18.10.2026; раньше строго больше)
 HALF_MINUTE_FROM = 65
 SHOTS_POSSESSION_ABOVE = 70  # категория half_shots: владение во втором тайме строго больше
-SHOTS_MIN = 2  # категория half_shots: удары в створ во втором тайме не меньше
+SHOTS_MIN = 3  # категория half_shots: удары в створ не меньше (с 28.10.2026 вечером; было 2)
 HALF_MAX_LEAD = 1  # команда проигрывает, играет вничью или ведёт не больше чем на мяч
 HALF_PREFILTER = 62  # оценка второго тайма выше этого порога → точный запрос по таймам
 ATTACK_POSSESSION_ABOVE = 55  # категория half_attack: владение во втором тайме строго больше
@@ -84,6 +84,7 @@ class Alert:
     teams_count: int | None = None
     home_points: int | None = None  # только для сообщения, в базе не хранятся
     away_points: int | None = None
+    source: str = "half"  # half_shots: «half» — статистика второго тайма, «match» — запасная, за матч
     extra: tuple = ()  # другие признаки того же матча в этой карточке (Alert)
 
     @property
@@ -176,6 +177,9 @@ def _detail_lines(alert: Alert) -> list[str]:
     if alert.category == "half":
         total = f" (за матч {alert.total_possession} %)" if alert.total_possession is not None else ""
         lines.append(f"Владение во 2-м тайме: {alert.possession} %{total}")
+    elif alert.category == "half_shots" and alert.source == "match":
+        opp = "?" if alert.opponent_shots is None else alert.opponent_shots
+        lines.append(f"За матч (по таймам данных нет): владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opp})")
     elif alert.category == "half_shots":
         lines.append(f"Во 2-м тайме: владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opponent})")
     elif alert.category == "half_attack":
@@ -362,9 +366,9 @@ def build_half_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) 
 
 
 def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
-    """Категория half_shots: минута 65–75, во 2-м тайме владение больше 70 % и 2+ удара в створ,
+    """Категория half_shots: минута 60–75, во 2-м тайме владение больше 70 % и 3+ удара в створ,
     команда проигрывает, играет вничью или ведёт не больше чем на один мяч."""
-    if not is_half_candidate(item):
+    if not is_candidate(item):
         return None
     teams = item.get("teams") or {}
     for side, other in (("home", "away"), ("away", "home")):
@@ -378,6 +382,21 @@ def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, 
             continue
         return _base_alert(item, side, "half_shots", possession=possession, shots=shots,
                            opponent_shots=(exact.get(other_id) or {}).get("shots"), total_possession=total.get(side))
+    return None
+
+
+def build_match_shots_alert(item: dict) -> Alert | None:
+    """Запасной вариант half_shots, когда статистики по таймам нет: те же пороги по статистике за матч."""
+    if not is_candidate(item):
+        return None
+    possession, shots = _possession_by_side(item), _shots_by_side(item)
+    for side, other in (("home", "away"), ("away", "home")):
+        if possession.get(side) is None or shots.get(side) is None:
+            continue
+        if possession[side] <= SHOTS_POSSESSION_ABOVE or shots[side] < SHOTS_MIN or _lead(item, side) > HALF_MAX_LEAD:
+            continue
+        return _base_alert(item, side, "half_shots", possession=possession[side], shots=shots[side],
+                           opponent_shots=shots.get(other), total_possession=possession[side], source="match")
     return None
 
 
@@ -638,12 +657,21 @@ def run_live_alerts(
                     or (on["half_attack"] and fixture_id not in sent["half_attack"])
                     or (on["half_shots"] and fixture_id not in sent["half_shots"]))
 
-            need = [i for i in ids if (on["stats"] and i not in sent["stats"]) or second_half_pending(i)]
+            def match_stats_pending(fixture_id: int) -> bool:
+                """Нет снимка на перерыве, статистики по таймам не будет: проверяем статистику за матч."""
+                return on["half_shots"] and fixture_id not in snapshots and fixture_id not in sent["half_shots"]
+
+            need = [i for i in ids if (on["stats"] and i not in sent["stats"]) or second_half_pending(i)
+                    or match_stats_pending(i)]
             for item in _fetch_by_ids(client, need):
                 fixture_id = int(item["fixture"]["id"])
                 fired = False
                 if on["stats"] and fixture_id not in sent["stats"]:
                     alert = build_alert(item)
+                    if alert is not None:
+                        fired = collect(alert) or fired
+                if match_stats_pending(fixture_id):
+                    alert = build_match_shots_alert(item)
                     if alert is not None:
                         fired = collect(alert) or fired
                 if second_half_pending(fixture_id) and is_candidate(item):
@@ -659,7 +687,7 @@ def run_live_alerts(
                                 and _lead(item, side) <= HALF_MAX_LEAD and est is not None and est > HALF_PREFILTER):
                             want_half = True
                         shots_first = snap["shots"].get(side)
-                        if (on["half_shots"] and fixture_id not in sent["half_shots"] and is_half_candidate(item)
+                        if (on["half_shots"] and fixture_id not in sent["half_shots"]
                                 and _lead(item, side) <= HALF_MAX_LEAD and side in total_shots and shots_first is not None
                                 and total_shots[side] - shots_first >= SHOTS_MIN
                                 and est is not None and est > HALF_PREFILTER):
@@ -677,6 +705,8 @@ def run_live_alerts(
                                 fired = collect(alert) or fired
                         if want_shots:
                             alert = build_half_shots_alert(item, exact, total)
+                            if alert is None and not any(v.get("possession") is not None for v in exact.values()):
+                                alert = build_match_shots_alert(item)  # по таймам данных нет
                             if alert is not None:
                                 fired = collect(alert) or fired
                         if want_attack:
