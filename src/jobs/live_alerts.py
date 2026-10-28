@@ -516,13 +516,14 @@ def _record_sent(conn, alert: Alert) -> None:
         cur.execute(
             """INSERT INTO live_alerts_sent (alert_id, fixture_id, category, league_id, home_name, away_name,
                    minute, goals_home, goals_away, team_side, possession, shots_on_goal, opponent_shots_on_goal,
-                   total_possession, kickoff_at, home_rank, away_rank, teams_count, also_categories)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   total_possession, kickoff_at, home_rank, away_rank, teams_count, also_categories, stats_source)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (fixture_id, category) DO NOTHING""",
             (alert.alert_id, alert.fixture_id, alert.category, alert.league_id, alert.home, alert.away,
              alert.minute, alert.goals_home, alert.goals_away, alert.team_side, alert.possession, alert.shots,
              alert.opponent_shots, alert.total_possession, alert.kickoff_at,
-             alert.home_rank, alert.away_rank, alert.teams_count, list(alert.categories[1:])),
+             alert.home_rank, alert.away_rank, alert.teams_count, list(alert.categories[1:]),
+             alert.source if alert.category == "half_shots" else None),
         )
 
 

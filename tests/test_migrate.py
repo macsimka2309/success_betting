@@ -200,10 +200,10 @@ def test_basketball_odds_key_allows_ladder_of_lines(conn):
 
 def test_basketball_down_drops_only_its_schema(conn):
     migrate.run_up(conn)
-    migrate.run_down(conn, max(m.version for m in migrate.discover()))
-    # откат последней миграции; для 016 проверяем отдельно, когда она последняя
-    versions = {m.version for m in migrate.discover()}
-    if "016" in versions and "016" in migrate.applied_versions(conn):
+    # откатываем в обратном порядке все миграции после 016 (их число растёт), затем саму 016
+    for version in sorted((m.version for m in migrate.discover() if m.version > "016"), reverse=True):
+        migrate.run_down(conn, version)
+    if "016" in migrate.applied_versions(conn):
         migrate.run_down(conn, "016")
     assert "games" not in bb_tables(conn)
     assert "fixtures" in table_names(conn)

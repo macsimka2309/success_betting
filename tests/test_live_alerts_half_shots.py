@@ -161,3 +161,21 @@ def test_draw_costs_no_extra_requests(tmp_path, conn):
 
 def test_only_half_shots_is_enabled_in_production():
     assert la.ENABLED_CATEGORIES == ("half_shots",)
+
+
+def stored_sources(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT stats_source, shots_on_goal, opponent_shots_on_goal FROM live_alerts_sent")
+        return cur.fetchall()
+
+
+def test_source_half_is_stored_with_second_half_shots(tmp_path, conn):
+    seed(conn)
+    full = detail_item(1, possession="68%", away_possession="32%", shots_home=5, shots_away=1, minute=70, home=0, away=1)
+    run(tmp_path, conn, [{"response": [item()]}, {"response": [full]}, exact_body(78, 4)])
+    assert stored_sources(conn) == [("half", 4, 0)]
+
+
+def test_source_match_is_stored_with_match_shots(tmp_path, conn):
+    run(tmp_path, conn, [{"response": [item()]}, {"response": [match_item(shots=5)]}])
+    assert stored_sources(conn) == [("match", 5, 0)]
