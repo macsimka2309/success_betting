@@ -29,8 +29,9 @@ POSSESSION_ABOVE = 55
 SHOTS_ON_GOAL_MIN = 6
 HALF_POSSESSION_MIN = 70  # владение во втором тайме не меньше (с 18.10.2026; раньше строго больше)
 HALF_MINUTE_FROM = 65
-SHOTS_POSSESSION_ABOVE = 70  # категория half_shots: владение во втором тайме строго больше
-SHOTS_MIN = 3  # категория half_shots: удары в створ не меньше (с 28.10.2026 вечером; было 2)
+SHOTS_POSSESSION_MIN = 70  # категория half_shots: владение не меньше (по таймам и за матч)
+HALF_SHOTS_MIN = 2  # half_shots по таймам: удары в створ во втором тайме не меньше
+MATCH_SHOTS_MIN = 3  # half_shots по статистике за матч (запасной вариант): удары в створ не меньше
 HALF_MAX_LEAD = 1  # команда проигрывает, играет вничью или ведёт не больше чем на мяч
 HALF_PREFILTER = 62  # оценка второго тайма выше этого порога → точный запрос по таймам
 ATTACK_POSSESSION_ABOVE = 55  # категория half_attack: владение во втором тайме строго больше
@@ -366,8 +367,7 @@ def build_half_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) 
 
 
 def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
-    """Категория half_shots: минута 60–75, во 2-м тайме владение больше 70 % и 3+ удара в створ,
-    команда проигрывает, играет вничью или ведёт не больше чем на один мяч."""
+    """Категория half_shots, правило 1: минута 60–75, во 2-м тайме владение не меньше 70 % и 2+ удара в створ."""
     if not is_candidate(item):
         return None
     teams = item.get("teams") or {}
@@ -376,9 +376,7 @@ def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, 
         other_id = to_int((teams.get(other) or {}).get("id"))
         stats = exact.get(team_id) or {}
         possession, shots = stats.get("possession"), stats.get("shots")
-        if possession is None or shots is None or possession <= SHOTS_POSSESSION_ABOVE or shots < SHOTS_MIN:
-            continue
-        if _lead(item, side) > HALF_MAX_LEAD:
+        if possession is None or shots is None or possession < SHOTS_POSSESSION_MIN or shots < HALF_SHOTS_MIN:
             continue
         return _base_alert(item, side, "half_shots", possession=possession, shots=shots,
                            opponent_shots=(exact.get(other_id) or {}).get("shots"), total_possession=total.get(side))
@@ -386,14 +384,14 @@ def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, 
 
 
 def build_match_shots_alert(item: dict) -> Alert | None:
-    """Запасной вариант half_shots, когда статистики по таймам нет: те же пороги по статистике за матч."""
+    """Категория half_shots, правило 2 (статистики по таймам нет): за матч владение не меньше 70 % и 3+ удара в створ."""
     if not is_candidate(item):
         return None
     possession, shots = _possession_by_side(item), _shots_by_side(item)
     for side, other in (("home", "away"), ("away", "home")):
         if possession.get(side) is None or shots.get(side) is None:
             continue
-        if possession[side] <= SHOTS_POSSESSION_ABOVE or shots[side] < SHOTS_MIN or _lead(item, side) > HALF_MAX_LEAD:
+        if possession[side] < SHOTS_POSSESSION_MIN or shots[side] < MATCH_SHOTS_MIN:
             continue
         return _base_alert(item, side, "half_shots", possession=possession[side], shots=shots[side],
                            opponent_shots=shots.get(other), total_possession=possession[side], source="match")
@@ -688,8 +686,8 @@ def run_live_alerts(
                             want_half = True
                         shots_first = snap["shots"].get(side)
                         if (on["half_shots"] and fixture_id not in sent["half_shots"]
-                                and _lead(item, side) <= HALF_MAX_LEAD and side in total_shots and shots_first is not None
-                                and total_shots[side] - shots_first >= SHOTS_MIN
+                                and side in total_shots and shots_first is not None
+                                and total_shots[side] - shots_first >= HALF_SHOTS_MIN
                                 and est is not None and est > HALF_PREFILTER):
                             want_shots = True
                         if (on["half_attack"] and fixture_id not in sent["half_attack"] and side in total_shots and shots_first is not None

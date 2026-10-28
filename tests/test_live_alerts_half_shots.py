@@ -1,4 +1,4 @@
-"""Категория half_shots: владение > 70 % и 3+ удара в створ (по таймам, запасной — за матч), минуты 60–75 (specs/онлайн-оповещения.md)."""
+"""Категория half_shots, минуты 60–75: по таймам владение >= 70 % и 2+ удара, иначе за матч владение >= 70 % и 3+ удара (specs/онлайн-оповещения.md)."""
 
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ def item(minute=70, home=0, away=1, status="2H"):
     return live_item(1, minute=minute, home=home, away=away, status=status)
 
 
-@pytest.mark.parametrize("poss,shots,expected", [(71, 3, True), (70, 5, False), (80, 2, False), (80, 3, True), (100, 9, True)])
-def test_possession_strictly_above_70_and_three_shots(poss, shots, expected):
+@pytest.mark.parametrize("poss,shots,expected", [(71, 2, True), (70, 2, True), (69, 5, False), (80, 1, False), (100, 9, True)])
+def test_halves_possession_70_or_more_and_two_shots(poss, shots, expected):
     assert (la.build_half_shots_alert(item(), ex(poss, shots), {}) is not None) == expected
 
 
@@ -37,9 +37,9 @@ def test_either_team_and_message():
     assert "Тип: владение и удары во 2-м тайме" in text and "владение 75 %, удары в створ 4" in text
 
 
-@pytest.mark.parametrize("goals,expected", [((0, 1), True), ((1, 1), True), ((2, 1), True), ((3, 1), False)])
-def test_lead_limit(goals, expected):
-    assert (la.build_half_shots_alert(item(home=goals[0], away=goals[1]), ex(75, 4), {}) is not None) == expected
+@pytest.mark.parametrize("goals", [(0, 1), (3, 1), (0, 4)])
+def test_score_is_not_a_condition(goals):
+    assert la.build_half_shots_alert(item(home=goals[0], away=goals[1]), ex(75, 2), {}) is not None
 
 
 @pytest.mark.parametrize("minute,expected", [(59, False), (60, True), (75, True), (76, False)])
@@ -87,7 +87,7 @@ def test_not_repeated_for_the_same_match(tmp_path, conn):
 
 
 def test_few_shots_in_second_half_skip_the_exact_request(tmp_path, conn):
-    seed(conn, hs=(3, 1))  # во втором тайме 4-3=1 удар
+    seed(conn, hs=(4, 1))  # во втором тайме 5-4=1 удар
     full = detail_item(1, possession="68%", away_possession="32%", shots_home=5, shots_away=1, minute=70, home=0, away=1)
     client, outbox = run(tmp_path, conn, [{"response": [item()]}, {"response": [full]}])
     assert outbox.messages == [] and client.requests_used == 2
@@ -96,7 +96,7 @@ def test_few_shots_in_second_half_skip_the_exact_request(tmp_path, conn):
 def test_exact_below_threshold_sends_nothing(tmp_path, conn):
     seed(conn)
     full = detail_item(1, possession="68%", away_possession="32%", shots_home=5, shots_away=1, minute=70, home=0, away=1)
-    _, outbox = run(tmp_path, conn, [{"response": [item()]}, {"response": [full]}, exact_body(70, 4)])
+    _, outbox = run(tmp_path, conn, [{"response": [item()]}, {"response": [full]}, exact_body(69, 4)])
     assert outbox.messages == []
 
 
@@ -115,14 +115,14 @@ def test_match_fallback_without_halftime_snapshot(tmp_path, conn):
     assert client.requests_used == 2
 
 
-@pytest.mark.parametrize("poss,shots", [("70%", 5), ("80%", 2)])
+@pytest.mark.parametrize("poss,shots", [("69%", 5), ("80%", 2)])
 def test_match_fallback_uses_the_same_thresholds(tmp_path, conn, poss, shots):
     _, outbox = run(tmp_path, conn, [{"response": [item()]}, {"response": [match_item(poss, shots)]}])
     assert outbox.messages == []
 
 
-def test_match_fallback_respects_score_and_window(tmp_path, conn):
-    assert la.build_match_shots_alert(match_item(home=3, away=1)) is None
+def test_match_fallback_window_and_score(tmp_path, conn):
+    assert la.build_match_shots_alert(match_item(home=3, away=1)) is not None  # счёт не фильтруется
     assert la.build_match_shots_alert(match_item(minute=59)) is None
     assert la.build_match_shots_alert(match_item(minute=60)) is not None
 
