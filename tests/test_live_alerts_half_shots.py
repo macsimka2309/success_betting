@@ -38,7 +38,7 @@ def test_either_team_and_message():
 
 
 @pytest.mark.parametrize("goals", [(0, 1), (3, 1), (0, 4)])
-def test_score_is_not_a_condition(goals):
+def test_lead_size_is_not_a_condition(goals):
     assert la.build_half_shots_alert(item(home=goals[0], away=goals[1]), ex(75, 2), {}) is not None
 
 
@@ -122,7 +122,7 @@ def test_match_fallback_uses_the_same_thresholds(tmp_path, conn, poss, shots):
 
 
 def test_match_fallback_window_and_score(tmp_path, conn):
-    assert la.build_match_shots_alert(match_item(home=3, away=1)) is not None  # счёт не фильтруется
+    assert la.build_match_shots_alert(match_item(home=3, away=1)) is not None  # разница в счёте не фильтруется
     assert la.build_match_shots_alert(match_item(minute=59)) is None
     assert la.build_match_shots_alert(match_item(minute=60)) is not None
 
@@ -144,4 +144,16 @@ def test_match_fallback_not_used_when_halves_say_no(tmp_path, conn):
 def test_match_fallback_not_repeated(tmp_path, conn):
     run(tmp_path, conn, [{"response": [item()]}, {"response": [match_item()]}])
     client, outbox = run(tmp_path / "b", conn, [{"response": [item()]}])
+    assert outbox.messages == [] and client.requests_used == 1
+
+
+@pytest.mark.parametrize("goals", [(0, 0), (1, 1), (2, 2)])
+def test_draws_are_not_taken(tmp_path, conn, goals):
+    assert la.build_half_shots_alert(item(home=goals[0], away=goals[1]), ex(80, 5), {}) is None
+    assert la.build_match_shots_alert(match_item(home=goals[0], away=goals[1])) is None
+
+
+def test_draw_costs_no_extra_requests(tmp_path, conn):
+    draw = live_item(1, minute=70, home=1, away=1)
+    client, outbox = run(tmp_path, conn, [{"response": [draw]}])
     assert outbox.messages == [] and client.requests_used == 1

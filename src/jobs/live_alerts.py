@@ -366,9 +366,15 @@ def build_half_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) 
     return None
 
 
+def _is_draw(item: dict) -> bool:
+    parsed = _score_and_minute(item)
+    return parsed is not None and parsed[1] == parsed[2]
+
+
 def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
-    """Категория half_shots, правило 1: минута 60–75, во 2-м тайме владение не меньше 70 % и 2+ удара в створ."""
-    if not is_candidate(item):
+    """Категория half_shots, правило 1: минута 60–75, во 2-м тайме владение не меньше 70 % и 2+ удара в створ.
+    Ничья на момент среза не берётся."""
+    if not is_candidate(item) or _is_draw(item):
         return None
     teams = item.get("teams") or {}
     for side, other in (("home", "away"), ("away", "home")):
@@ -385,7 +391,7 @@ def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, 
 
 def build_match_shots_alert(item: dict) -> Alert | None:
     """Категория half_shots, правило 2 (статистики по таймам нет): за матч владение не меньше 70 % и 3+ удара в створ."""
-    if not is_candidate(item):
+    if not is_candidate(item) or _is_draw(item):
         return None
     possession, shots = _possession_by_side(item), _shots_by_side(item)
     for side, other in (("home", "away"), ("away", "home")):
@@ -653,11 +659,14 @@ def run_live_alerts(
                 return fixture_id in snapshots and (
                     (on["half"] and fixture_id not in sent["half"])
                     or (on["half_attack"] and fixture_id not in sent["half_attack"])
-                    or (on["half_shots"] and fixture_id not in sent["half_shots"]))
+                    or (on["half_shots"] and fixture_id not in sent["half_shots"] and fixture_id not in draws))
+
+            draws = {int(i["fixture"]["id"]) for i in candidates if _is_draw(i)}
 
             def match_stats_pending(fixture_id: int) -> bool:
                 """Нет снимка на перерыве, статистики по таймам не будет: проверяем статистику за матч."""
-                return on["half_shots"] and fixture_id not in snapshots and fixture_id not in sent["half_shots"]
+                return (on["half_shots"] and fixture_id not in snapshots and fixture_id not in sent["half_shots"]
+                        and fixture_id not in draws)
 
             need = [i for i in ids if (on["stats"] and i not in sent["stats"]) or second_half_pending(i)
                     or match_stats_pending(i)]
@@ -685,7 +694,7 @@ def run_live_alerts(
                                 and _lead(item, side) <= HALF_MAX_LEAD and est is not None and est > HALF_PREFILTER):
                             want_half = True
                         shots_first = snap["shots"].get(side)
-                        if (on["half_shots"] and fixture_id not in sent["half_shots"]
+                        if (on["half_shots"] and fixture_id not in sent["half_shots"] and fixture_id not in draws
                                 and side in total_shots and shots_first is not None
                                 and total_shots[side] - shots_first >= HALF_SHOTS_MIN
                                 and est is not None and est > HALF_PREFILTER):
