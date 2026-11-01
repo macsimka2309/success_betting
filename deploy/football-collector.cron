@@ -10,7 +10,7 @@
 #   03:00    06:00    очистка кэша старше 30 дней
 #   05:00    08:00    каталог лиг (по понедельникам)
 #   06:00    09:00    ежедневный сбор: матчи, травмы, события, статистика, составы
-#   06:30    09:30    препроцессинг --upcoming: признаки будущих матчей (ДП-9а)
+#   после свежих шагов daily: препроцессинг --upcoming (перед backfill)
 #   07:00    10:00    дозагрузка международных турниров (ВРЕМЕННО, см. ниже)
 #   12:00    15:00    коэффициенты, снимок 2
 #   04:00    07:00    проверка бэкапа и свободного места (docs/04, расхождение 4)
@@ -18,8 +18,7 @@
 # Бюджеты запросов заданы явно: у каждого процесса свой счётчик, поэтому сумма
 # по суткам — не больше 6 500 + 2 x 300 + 50 + 300 = 7 450 при лимите тарифа 7 500.
 # build_features --upcoming запросов к API не делает (только к базе) — в этот
-# бюджет не входит; поставлен через 30 минут после ежедневного сбора, чтобы
-# использовать уже свежие данные дня (docs/06, этап 8).
+# бюджет не входит; запускается daily после свежих шагов (specs/надёжность-сбора.md).
 #
 # international-backfill — ВРЕМЕННАЯ строка (docs/06, этап 9, добавлена
 # 01.10.2026): статистика/события/составы для 10 международных турниров
@@ -56,7 +55,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 6    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh cleanup
 0 8    * * 1  deploy  /opt/apps/football-collector/deploy/run_collect.sh catalog 50
 0 9    * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh daily 63000
-30 9   * * *  deploy  /opt/apps/football-collector/deploy/run_build_features.sh upcoming
+# upcoming вызывается daily после свежих шагов, до backfill (019).
+# live-odds пока не включён: перед запуском согласовать бюджет и рост архива.
 0 10   * * *  deploy  /opt/apps/football-collector/deploy/run_collect.sh international-backfill 300
 0 7    * * *  deploy  /opt/apps/football-collector/deploy/check_backup.sh /opt/apps/football-db/backups
 */5 * * * *  deploy  /opt/apps/football-collector/deploy/run_live_alerts.sh

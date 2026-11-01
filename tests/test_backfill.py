@@ -279,14 +279,14 @@ def test_backfill_writes_one_journal_row_with_totals(tmp_path, conn):
             "SELECT status, requests_used, items_processed FROM collection_runs "
             "WHERE job_name = 'backfill'"
         )
-        assert cur.fetchall() == [("success", 6, 6)]
+        assert cur.fetchall() == [("success", 6, 2)]  # только события: пустые статистика/составы ждут повтора
 
 
 def test_backfill_prints_breakdown_by_kind(tmp_path, conn, capsys):
     seed(conn, [(1, date(2026, 9, 10))])
     collect.run_backfill(make_client(tmp_path, [EMPTY] * 3), conn, since=SINCE, today=TODAY)
 
-    assert "события 1, статистика 1, составы 1" in capsys.readouterr().out
+    assert "события 1, статистика 0, составы 0" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------- отчёт (ДЗ-9)

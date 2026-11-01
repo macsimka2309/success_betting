@@ -106,10 +106,12 @@ class ApiClient:
     now: Callable[[], float] = time.time
     verbose: bool = True
     base_url: str = BASE_URL
+    observer: Callable[[str, dict, dict, float, float], None] | None = None
 
     requests_used: int = field(default=0, init=False)
     daily_remaining: str | None = field(default=None, init=False)
     quota_exhausted: bool = field(default=False, init=False)
+    failed_requests: int = field(default=0, init=False)
     _last_send: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
@@ -180,17 +182,22 @@ class ApiClient:
             return None
 
         self.requests_used += 1
+        requested_at = self.now()
         body = self._fetch_with_retries(endpoint, params)
         if body is None:
+            self.failed_requests += 1
             return None
 
         if body.get("errors"):
+            self.failed_requests += 1
             # Ошибка не по лимиту (авторизация, неверный параметр) — не кэшируем,
             # иначе временная проблема застряла бы в кэше навсегда.
             if self.verbose:
                 print(f"  ! ошибка API на {endpoint} {params}: {body['errors']}")
             return body
 
+        if self.observer is not None:
+            self.observer(endpoint, params, body, requested_at, self.now())
         self._write_cache(endpoint, params, body)
         return body
 

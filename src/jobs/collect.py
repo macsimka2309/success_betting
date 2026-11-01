@@ -20,9 +20,10 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterator
+from typing import Callable, Iterator
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from src.api.client import ApiClient
 from src.common.convert import to_decimal, to_int, to_percent, to_text, to_utc
@@ -100,6 +101,18 @@ def collection_run(conn: psycopg.Connection, client: ApiClient, job_name: str) -
         run_id = cur.fetchone()[0]
     requests_before = client.requests_used
     ctx = StepContext(run_id=run_id)
+    previous_observer = client.observer
+
+    def archive(endpoint, params, body, requested_at, observed_at):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO api_observations (run_id, endpoint, params, requested_at, observed_at, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (run_id, endpoint, Jsonb(params), datetime.fromtimestamp(requested_at, timezone.utc),
+                 datetime.fromtimestamp(observed_at, timezone.utc), Jsonb(body)),
+            )
+
+    client.observer = archive
     try:
         yield ctx
     except Exception as exc:
@@ -109,6 +122,8 @@ def collection_run(conn: psycopg.Connection, client: ApiClient, job_name: str) -
         budget_hit = client.quota_exhausted or client.requests_used >= client.max_requests
         status = "quota_exceeded" if budget_hit else "success"
         _finish_run(conn, run_id, status, client.requests_used - requests_before, ctx)
+    finally:
+        client.observer = previous_observer
 
 
 def _finish_run(conn, run_id: int, status: str, requests_used: int, ctx: StepContext, error_text: str | None = None) -> None:
@@ -147,6 +162,7 @@ def mark_attempt(conn, fixture_id: int, field_name: str) -> None:
                 SET {column} = fixture_fetch_state.{column} + 1""",
             (fixture_id,),
         )
+    record_result(conn, fixture_id, field_name, "error")
 
 
 def mark_fetched(conn, fixture_id: int, field_name: str) -> None:
@@ -157,6 +173,48 @@ def mark_fetched(conn, fixture_id: int, field_name: str) -> None:
                 ON CONFLICT (fixture_id) DO UPDATE SET {column} = now()""",
             (fixture_id,),
         )
+    record_result(conn, fixture_id, field_name, "loaded")
+
+
+def record_result(conn, fixture_id: int, kind: str, status: str) -> None:
+    """Отдельный результат: исчерпанные попытки не означают unsupported."""
+    max_attempts = 3 if status == "error" else 4
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO fixture_fetch_results (fixture_id, kind, status, next_retry_at)
+               VALUES (%s, %s, %s, CASE WHEN %s = 'loaded' THEN NULL ELSE now() + interval '24 hours' END)
+               ON CONFLICT (fixture_id, kind) DO UPDATE SET
+                 attempts = fixture_fetch_results.attempts + 1,
+                 status = CASE WHEN %s <> 'loaded' AND fixture_fetch_results.attempts + 1 >= %s
+                               THEN 'exhausted' ELSE %s END,
+                 checked_at = now(), next_retry_at = EXCLUDED.next_retry_at""",
+            (fixture_id, kind, status, status, status, max_attempts, status),
+        )
+
+
+def complete_response(conn, fixture_id: int, items: list, kind: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT home_team_id, away_team_id FROM fixtures WHERE fixture_id=%s", (fixture_id,))
+        expected = set(cur.fetchone())
+    complete = set()
+    for entry in items:
+        team_id = to_int((entry.get("team") or {}).get("id"))
+        if kind == "lineups":
+            valid = bool(entry.get("startXI"))
+        else:
+            blocks = ("statistics_1h", "statistics_2h") if kind == "halves" else ("statistics",)
+            valid = all(any(v is not None for v in _parse_statistics_row(entry, b).values()) for b in blocks)
+        if valid:
+            complete.add(team_id)
+    return expected <= complete
+
+
+def mark_response(conn, fixture_id: int, items: list, kind: str) -> bool:
+    if complete_response(conn, fixture_id, items, kind):
+        mark_fetched(conn, fixture_id, kind)
+        return True
+    record_result(conn, fixture_id, kind, "partial" if items else "empty")
+    return False
 
 
 def _pending_fixtures(
@@ -209,6 +267,11 @@ def _pending_fixtures(
         WHERE f.status_short = ANY(%s)
           AND COALESCE(ls.{coverage_column}, true)
           AND {need_filter}{date_filter}{league_filter}
+          AND NOT EXISTS (
+              SELECT 1 FROM fixture_fetch_results r
+              WHERE r.fixture_id = f.fixture_id AND r.kind = '{field_name}'
+                AND (r.status IN ('loaded', 'exhausted') OR r.next_retry_at > now())
+          )
         ORDER BY f.match_date DESC, f.fixture_id
         LIMIT %s
     """
@@ -221,7 +284,7 @@ def _fetch_items(
     client: ApiClient, endpoint: str, fixture_id: int, extra: dict | None = None
 ) -> list | None:
     """Возвращает список из `response`, None при неудаче, бросает Stop при бюджете."""
-    body = client.get(endpoint, {"fixture": fixture_id, **(extra or {})})
+    body = client.get(endpoint, {"fixture": fixture_id, **(extra or {})}, use_cache=False)
     if body is None:
         if client.quota_exhausted or client.requests_used >= client.max_requests:
             raise Stop()
@@ -697,9 +760,9 @@ def _process_statistics(client: ApiClient, conn, fixture_id: int) -> bool:
             "fixture_id, team_id",
         )
         _write_halves(conn, fixture_id, team_id, entry)
-    mark_fetched(conn, fixture_id, "statistics")
-    mark_fetched(conn, fixture_id, "halves")
-    return True
+    complete = mark_response(conn, fixture_id, items, "statistics")
+    mark_response(conn, fixture_id, items, "halves")
+    return complete
 
 
 def _process_halves(client: ApiClient, conn, fixture_id: int) -> bool:
@@ -718,8 +781,7 @@ def _process_halves(client: ApiClient, conn, fixture_id: int) -> bool:
             continue
         _upsert_team(conn, team_id, team.get("name"))
         _write_halves(conn, fixture_id, team_id, entry)
-    mark_fetched(conn, fixture_id, "halves")
-    return True
+    return mark_response(conn, fixture_id, items, "halves")
 
 
 def _process_lineups(client: ApiClient, conn, fixture_id: int) -> bool:
@@ -753,8 +815,7 @@ def _process_lineups(client: ApiClient, conn, fixture_id: int) -> bool:
                     (fixture_id, team_id, player_id, is_starter, to_int(player.get("number")), to_text(player.get("pos")), to_text(player.get("grid"))),
                     "fixture_id, team_id, player_id",
                 )
-    mark_fetched(conn, fixture_id, "lineups")
-    return True
+    return mark_response(conn, fixture_id, items, "lineups")
 
 
 KINDS = ("events", "statistics", "lineups")
@@ -875,11 +936,20 @@ def backfill_report(
         WITH pend AS (
             SELECT f.match_date,
                    (s.events_fetched_at IS NULL AND COALESCE(s.events_attempts, 0) < %(max)s
-                        AND COALESCE(ls.has_events, true)) AS need_events,
+                        AND COALESCE(ls.has_events, true)
+                        AND NOT EXISTS (SELECT 1 FROM fixture_fetch_results r
+                          WHERE r.fixture_id=f.fixture_id AND r.kind='events'
+                            AND r.status IN ('loaded','exhausted'))) AS need_events,
                    (s.statistics_fetched_at IS NULL AND COALESCE(s.statistics_attempts, 0) < %(max)s
-                        AND COALESCE(ls.has_statistics, true)) AS need_statistics,
+                        AND COALESCE(ls.has_statistics, true)
+                        AND NOT EXISTS (SELECT 1 FROM fixture_fetch_results r
+                          WHERE r.fixture_id=f.fixture_id AND r.kind='statistics'
+                            AND r.status IN ('loaded','exhausted'))) AS need_statistics,
                    (s.lineups_fetched_at IS NULL AND COALESCE(s.lineups_attempts, 0) < %(max)s
-                        AND COALESCE(ls.has_lineups, true)) AS need_lineups
+                        AND COALESCE(ls.has_lineups, true)
+                        AND NOT EXISTS (SELECT 1 FROM fixture_fetch_results r
+                          WHERE r.fixture_id=f.fixture_id AND r.kind='lineups'
+                            AND r.status IN ('loaded','exhausted'))) AS need_lineups
             FROM fixtures f
             JOIN leagues l ON l.league_id = f.league_id AND l.is_tracked
             LEFT JOIN league_seasons ls ON ls.league_id = f.league_id AND ls.season = f.season
@@ -910,6 +980,8 @@ def backfill_report(
           AND COALESCE(ls.has_statistics, true)
           AND EXISTS (SELECT 1 FROM fixture_statistics fs WHERE fs.fixture_id = f.fixture_id)
           AND s.halves_fetched_at IS NULL AND COALESCE(s.halves_attempts, 0) < %(max)s
+          AND NOT EXISTS (SELECT 1 FROM fixture_fetch_results r
+            WHERE r.fixture_id=f.fixture_id AND r.kind='halves' AND r.status IN ('loaded','exhausted'))
     """
     with conn.cursor() as cur:
         cur.execute(halves_sql, params)
@@ -1142,6 +1214,7 @@ def run_daily(
     backfill: bool = True,
     backfill_since: date = DEFAULT_BACKFILL_SINCE,
     today: date | None = None,
+    after_fresh: Callable[[], None] | None = None,
 ) -> list[StepContext]:
     """Ежедневный сбор: матчи, травмы, свежие события/статистика/составы, дозагрузка.
 
@@ -1157,17 +1230,20 @@ def run_daily(
         lambda: run_statistics(client, conn, fresh_days=fresh_days, today=today),
         lambda: run_lineups(client, conn, fresh_days=fresh_days, today=today),
     ]
-    if backfill:
-        steps.append(
-            lambda: run_backfill(
-                client, conn, since=backfill_since, fresh_days=fresh_days, today=today
-            )
-        )
+    failures_before = client.failed_requests
     results = []
     for step in steps:
         results.append(step())
         if client.quota_exhausted:
             break
+    fresh_ok = (len(results) == len(steps) and client.failed_requests == failures_before
+                and _budget_left(client))
+    if after_fresh is not None:
+        if not fresh_ok:
+            raise RuntimeError("свежий сбор завершён с ошибками или исчерпан бюджет; признаки не запущены")
+        after_fresh()
+    if backfill and not client.quota_exhausted:
+        results.append(run_backfill(client, conn, since=backfill_since, fresh_days=fresh_days, today=today))
     return results
 
 
@@ -1194,8 +1270,34 @@ JOBS = {
         fresh_days=args.fresh_days,
         backfill=not args.no_backfill,
         backfill_since=args.backfill_since,
+        after_fresh=build_upcoming if args.build_upcoming else None,
     ),
 }
+
+
+def build_upcoming():
+    import subprocess
+
+    subprocess.run([sys.executable, "-m", "src.jobs.build_features", "--upcoming"], check=True)
+
+
+def run_live_odds(client: ApiClient, conn) -> StepContext:
+    """Полный live-ответ сохраняется наблюдателем, без смешивания с prematch."""
+    with collection_run(conn, client, "live_odds") as ctx:
+        page = 1
+        while True:
+            body = client.get("/odds/live", {} if page == 1 else {"page": page}, use_cache=False)
+            if body is None or body.get("errors"):
+                raise RuntimeError("неполный снимок live-коэффициентов")
+            ctx.items_processed += len(body.get("response") or [])
+            paging = body.get("paging") or {}
+            if page >= (paging.get("total") or 1):
+                break
+            page += 1
+    return ctx
+
+
+JOBS["live-odds"] = lambda client, conn, args: run_live_odds(client, conn)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1209,9 +1311,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fresh-days", type=int, default=FRESH_DAYS)
     parser.add_argument("--backfill-since", type=date.fromisoformat, default=DEFAULT_BACKFILL_SINCE)
     parser.add_argument("--no-backfill", action="store_true", help="daily без дозагрузки")
+    parser.add_argument("--build-upcoming", action="store_true", help="daily: признаки после свежего сбора, перед историей")
     parser.add_argument("--avg-leftover", type=int, default=5_500, help="для оценки срока в отчёте")
     parser.add_argument("--cache-dir", type=Path, default=Path("cache"))
     args = parser.parse_args(argv)
+    if args.build_upcoming and args.job != "daily":
+        parser.error("--build-upcoming применяется только к daily")
 
     if args.job == "cleanup":
         # Только удаление старых файлов кэша (ADR-2): ни ключ, ни база не нужны.

@@ -118,8 +118,8 @@ def test_statistics_step_writes_total_and_halves_with_one_request(tmp_path, conn
     assert fetch_state(conn, 1) == (True, True, 0)
 
 
-def test_missing_half_blocks_are_not_an_error(tmp_path, conn):
-    """ПТ-6: лига не отдаёт таймы — итог пишется, строк таймов нет, попытки не растут."""
+def test_missing_half_blocks_are_retried(tmp_path, conn):
+    """019: пустые таймы не считаются полученными; итог сохранён."""
     seed(conn, [(1, date(2026, 9, 24))])
     body = {"response": [team_entry(36, block("60%", 4)), team_entry(34, block("40%", 1))]}
     client = make_client(tmp_path, [body])
@@ -127,7 +127,7 @@ def test_missing_half_blocks_are_not_an_error(tmp_path, conn):
     collect.run_statistics(client, conn, today=TODAY)
 
     assert halves_rows(conn, 1) == []
-    assert fetch_state(conn, 1) == (True, True, 0)
+    assert fetch_state(conn, 1) == (True, False, 0)
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM fixture_statistics WHERE fixture_id = 1")
         assert cur.fetchone()[0] == 2
@@ -203,7 +203,13 @@ def test_halves_backfill_gives_up_after_max_attempts(tmp_path, conn):
     failing = {"errors": {"server": "boom"}, "response": []}
     client = make_client(tmp_path, [failing] * 10, max_requests=10)
 
-    collect.run_backfill(client, conn, since=SINCE, today=TODAY)
+    for _ in range(collect.MAX_ATTEMPTS):
+        collect.run_backfill(client, conn, since=SINCE, today=TODAY)
+        # Следующий cron в тот же день не должен повторять запрос.
+        used = client.requests_used
+        collect.run_backfill(client, conn, since=SINCE, today=TODAY)
+        assert client.requests_used == used
+        conn.execute("UPDATE fixture_fetch_results SET next_retry_at=now()-interval '1 second'")
 
     assert [c for c in calls(client) if c == ("statistics", 1)] == [("statistics", 1)] * collect.MAX_ATTEMPTS
     assert fetch_state(conn, 1) == (False, False, collect.MAX_ATTEMPTS)

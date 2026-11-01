@@ -34,6 +34,7 @@ cd "$ROOT" || exit 1
 set -a; . ./.env; set +a
 
 ARGS=(--job "$JOB" --cache-dir "$ROOT/cache")
+[ "$JOB" = daily ] && ARGS+=(--build-upcoming)
 [ -n "$MAX_REQUESTS" ] && ARGS+=(--max-requests "$MAX_REQUESTS")
 
 log "старт $JOB ${MAX_REQUESTS:+(бюджет $MAX_REQUESTS)}"
