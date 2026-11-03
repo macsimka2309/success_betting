@@ -1130,6 +1130,46 @@ def run_international_fixtures(client: ApiClient, conn) -> StepContext:
     return ctx
 
 
+HISTORICAL_LEAGUE_IDS = (12, 13, 16, 17, 18, 949, 1136, 1140, 1164,
+                         534, 540, 767, 768, 856, 869, 1028, 1129, 1132, 1162)
+
+
+def run_historical_fixtures(client: ApiClient, conn) -> None:
+    """Возобновляемая очередь списков матчей; прогресс в collection_runs."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT ls.league_id, ls.season FROM league_seasons ls
+               JOIN leagues l USING (league_id)
+               WHERE ls.league_id = ANY(%s) AND l.is_tracked AND ls.season >= 2018 AND ls.season <= %s
+                 AND ls.end_date < %s::date - 7
+                 AND NOT EXISTS (SELECT 1 FROM collection_runs r
+                   WHERE r.job_name = 'historical_fixtures_' || ls.league_id || '_' || ls.season
+                     AND r.status = 'success')
+               ORDER BY ls.season DESC, ls.league_id""",
+            (list(HISTORICAL_LEAGUE_IDS), _today().year, _today()),
+        )
+        pending = cur.fetchall()
+    for league_id, season in pending:
+        if not _budget_left(client):
+            break
+        try:
+            with collection_run(conn, client, f"historical_fixtures_{league_id}_{season}") as ctx:
+                body = client.get("/fixtures", {"league": league_id, "season": season}, use_cache=False)
+                if body is None or body.get("errors") or not body.get("response"):
+                    raise RuntimeError(f"не получен список матчей {league_id}/{season}; пара остаётся в очереди")
+                for item in body["response"]:
+                    parsed = _parse_fixture_item(item, league_id, season)
+                    if parsed is None:
+                        raise ValueError(f"некорректный матч {league_id}/{season}; пара остаётся в очереди")
+                    _upsert_team(conn, parsed["home_team_id"], parsed["home_team_name"])
+                    _upsert_team(conn, parsed["away_team_id"], parsed["away_team_name"])
+                    write_row(conn, "fixtures", list(FIXTURE_COLUMNS),
+                              tuple(parsed[c] for c in FIXTURE_COLUMNS), "fixture_id")
+                    ctx.items_processed += 1
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc))
+
+
 def run_international_backfill(client: ApiClient, conn, chunk: int = BACKFILL_CHUNK) -> StepContext:
     """Статистика/события/составы для международных турниров (docs/06, этап 9).
 
@@ -1139,6 +1179,7 @@ def run_international_backfill(client: ApiClient, conn, chunk: int = BACKFILL_CH
     отдельный бюджет (временный cron, см. deploy/) не тратился на обычную
     клубную дозагрузку (ФТ-11), у которой свой путь и свой бюджет.
     """
+    run_historical_fixtures(client, conn)
     done = dict.fromkeys(KINDS, 0)
     with collection_run(conn, client, "international_backfill") as ctx:
         active = list(KINDS)
