@@ -47,6 +47,13 @@ class HttpResponse:
     body: bytes
 
 
+@dataclass(frozen=True)
+class ObservationReceipt:
+    requested_at: float
+    observed_at: float
+    observation_id: int | None
+
+
 Transport = Callable[[str, dict[str, str], float], HttpResponse]
 
 
@@ -106,7 +113,8 @@ class ApiClient:
     now: Callable[[], float] = time.time
     verbose: bool = True
     base_url: str = BASE_URL
-    observer: Callable[[str, dict, dict, float, float], None] | None = None
+    observer: Callable[[str, dict, dict, float, float], int | None] | None = None
+    last_observation: ObservationReceipt | None = field(default=None, init=False)
 
     requests_used: int = field(default=0, init=False)
     daily_remaining: str | None = field(default=None, init=False)
@@ -166,6 +174,7 @@ class ApiClient:
         застрял бы в кэше навсегда).
         """
         params = params or {}
+        self.last_observation = None
         if use_cache:
             cached = self.cached(endpoint, params)
             if cached is not None:
@@ -196,8 +205,11 @@ class ApiClient:
                 print(f"  ! ошибка API на {endpoint} {params}: {body['errors']}")
             return body
 
+        observed_at = self.now()
+        observation_id = None
         if self.observer is not None:
-            self.observer(endpoint, params, body, requested_at, self.now())
+            observation_id = self.observer(endpoint, params, body, requested_at, observed_at)
+        self.last_observation = ObservationReceipt(requested_at, observed_at, observation_id)
         self._write_cache(endpoint, params, body)
         return body
 

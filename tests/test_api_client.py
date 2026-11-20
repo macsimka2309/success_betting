@@ -280,3 +280,16 @@ def test_cleanup_removes_only_old_files(tmp_path):
     assert removed == 1
     assert not old.exists()
     assert fresh.exists()
+
+
+def test_observation_receipt_is_only_for_fresh_success(tmp_path):
+    transport = FakeTransport([json_response({'response': [1]}), json_response({'errors': {'server': 'failed'}})])
+    client = make_client(tmp_path, transport)
+    client.observer = lambda *args: 123
+    client.get('/fixtures', {'id': 1})
+    assert client.last_observation.observation_id == 123
+    assert client.last_observation.requested_at <= client.last_observation.observed_at
+    client.get('/fixtures', {'id': 1})  # cached, no new observation
+    assert client.last_observation is None
+    client.get('/fixtures', {'id': 2})
+    assert client.last_observation is None

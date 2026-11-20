@@ -107,10 +107,11 @@ def collection_run(conn: psycopg.Connection, client: ApiClient, job_name: str) -
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO api_observations (run_id, endpoint, params, requested_at, observed_at, payload) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING observation_id",
                 (run_id, endpoint, Jsonb(params), datetime.fromtimestamp(requested_at, timezone.utc),
                  datetime.fromtimestamp(observed_at, timezone.utc), Jsonb(body)),
             )
+            return cur.fetchone()[0]
 
     client.observer = archive
     try:
