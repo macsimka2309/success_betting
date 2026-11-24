@@ -6,6 +6,7 @@ import time
 from psycopg.types.json import Jsonb
 
 from src.jobs.alert_rules import TTL, fresh, pressure, usable
+from src.jobs.league_goals import league_goals_for_signal, league_goals_line
 from src.jobs.signal_goal_store import latest_fonbet_browser_clock
 from src.jobs.signal_reminder_history import available_polls, current_api_team_ids, expected_api_teams
 
@@ -189,17 +190,21 @@ def dispatch_reminders(conn,send,*,now_fn=lambda:datetime.now(timezone.utc),limi
                 if state=='waiting':continue
                 if state!='ready':
                     cancel(job['signal_id'],state,now);continue
+                original=job['first_context']
+                metric = original.get('league_goals')
+                if 'league_goals' not in original:
+                    metric = league_goals_for_signal(conn, original, job['first_sent_at'])
                 if deadline-clock()<30:
                     report['reminder_budget_deferred']+=1;break
                 conn.execute("""UPDATE live_signal_reminders SET state='sending',attempts=attempts+1,
                   lease_until=%s,context=%s,updated_at=%s WHERE signal_id=%s""",
                   (now+timedelta(seconds=90),Jsonb(json_ready(context)),now,job['signal_id']))
-            original=job['first_context']
             minute=str(context['elapsed'])
             if context.get('added_minute'):minute+='+'+str(context['added_minute'])
             text=(f"Напоминание о сигнале №{job['signal_id']} (первое сообщение №{job['first_message_id']})\n"
                   f"{original.get('home','?')} — {original.get('away','?')}\nМинута: {minute}\n"
-                  f"Удары в створ во 2-м тайме: {context['home_shots']} : {context['away_shots']}")
+                  f"Удары в створ во 2-м тайме: {context['home_shots']} : {context['away_shots']}\n"
+                  f"{league_goals_line(metric)}")
             if job['first_source']=='fonbet' and original.get('event_url'):text+='\n'+original['event_url']
             try:
                 reply=getattr(send,'reply',None)

@@ -71,9 +71,24 @@ def test_api_negative_beats_positive_fonbet(conn):
     assert conn.execute('SELECT count(*) FROM live_alert_outbox').fetchone()[0]==0
 
 
-@pytest.mark.parametrize('kind',['stale','unknown'])
+def use_api_full_match_only(conn):
+    stats = {side: {'match': {'shots_on_goal': value}} for side, value in [('home', 9), ('away', 0)]}
+    conn.execute('UPDATE live_match_statistics_75 SET statistics=%s WHERE fixture_id=10', (Jsonb(stats),))
+
+
+def test_full_match_statistics_alone_cannot_trigger_first_signal(conn):
+    api(conn)
+    use_api_full_match_only(conn)
+    assert run(conn, lambda *args: pytest.fail('no confirmed second-half statistics'))['unusable'] == 1
+    assert conn.execute('SELECT count(*) FROM live_alert_outbox').fetchone() == (0,)
+
+
+@pytest.mark.parametrize('kind',['stale','unknown','full_match_only'])
 def test_fonbet_fallback(conn,kind):
-    api(conn,4,None,when=NOW-timedelta(minutes=3) if kind=='stale' else NOW);fb(conn);link(conn)
+    api(conn,4,None,when=NOW-timedelta(minutes=3) if kind=='stale' else NOW)
+    if kind == 'full_match_only':
+        use_api_full_match_only(conn)
+    fb(conn);link(conn)
     captured=[];assert run(conn,lambda t,m:captured.append(t) or 9)['sent']==1
     assert 'Источник: Fonbet' in captured[0]
     # Known API-ID still creates registry-compatible buttons and a legacy alert row.

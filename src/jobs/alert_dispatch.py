@@ -15,6 +15,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from src.jobs.alert_rules import choose, pressure, shots, fresh
+from src.jobs.league_goals import league_goals_for_signal, league_goals_line
 from src.jobs.signal_tracking import DeliveryReceipt, enrollment, record_confirmed
 
 LOCK = 27001
@@ -30,7 +31,8 @@ SELECT 'api_football' AS source,a.fixture_id::text AS event_id,a.fixture_id,
  c.observed_at AS context_at,c.status,c.elapsed AS current_minute,c.present,c.format_tags,
  'https://www.api-football.com/'::text AS event_url,
  a.requested_at AS statistics_requested_at,a.context_observed_at AS statistics_context_at,
- a.context_observation_id::text AS statistics_poll_id,a.run_id AS statistics_collection_run_id, a.observation_id::text AS statistics_observation_id
+ a.context_observation_id::text AS statistics_poll_id,a.run_id AS statistics_collection_run_id, a.observation_id::text AS statistics_observation_id,
+ a.season AS league_season
 FROM live_match_statistics_75 a
 LEFT JOIN leagues l USING(league_id)
 LEFT JOIN teams h ON h.team_id=a.home_team_id
@@ -50,10 +52,12 @@ SELECT 'fonbet',f.fonbet_event_id,f.fixture_id,f.fonbet_event_id,f.competition_n
  CASE WHEN f.home_away_swapped THEN f.goals_home ELSE f.goals_away END,
  to_jsonb(CASE WHEN f.home_away_swapped THEN f.shots_including_goals_2h_away ELSE f.shots_including_goals_2h_home END),
  to_jsonb(CASE WHEN f.home_away_swapped THEN f.shots_including_goals_2h_home ELSE f.shots_including_goals_2h_away END),
- f.kickoff_at,core.league_id,f.mapping_status,f.mapping_candidates,
- c.observed_at,c.status,c.elapsed,c.present,c.format_tags,f.event_url,f.requested_at,f.context_observed_at,f.run_id::text,NULL::bigint,f.observation_id::text
+ f.kickoff_at,COALESCE(core.league_id,linked.league_id),f.mapping_status,f.mapping_candidates,
+ c.observed_at,c.status,c.elapsed,c.present,c.format_tags,f.event_url,f.requested_at,f.context_observed_at,f.run_id::text,NULL::bigint,f.observation_id::text,
+ COALESCE(core.season,linked.season)
 FROM fonbet_live_statistics_75_normalized f
 LEFT JOIN fixtures core ON core.fixture_id=f.fixture_id
+LEFT JOIN live_match_statistics_75 linked ON linked.fixture_id=f.fixture_id AND f.mapping_status='confirmed'
 LEFT JOIN live_alert_context c ON c.source='fonbet' AND c.source_event_id=f.fonbet_event_id
 WHERE f.observed_at>=%s AND f.observed_at<=%s
 """
@@ -133,6 +137,7 @@ def message(row, alert_id):
     if isinstance(observed,str):observed=datetime.fromisoformat(observed)
     from zoneinfo import ZoneInfo
     text=(f"ID: {alert_id}\nТип: удары в створ во 2-м тайме\nЛига: {row['league']}\n"
+          f"{league_goals_line(row.get('league_goals'))}\n"
           f"Матч: {row['home']} — {row['away']}\nМинута: {row['elapsed']}' | Счёт: {unknown(row['goals_home'])}:{unknown(row['goals_away'])}\n"
           f"Во 2-м тайме: {unknown(home)} : {unknown(away)}, суммарно {unknown(total)}\n"
           f"Условие: {'≥6 у команды' if any(v is not None and v>=6 for v in (home,away)) else '≥8 суммарно'}\n"
@@ -238,6 +243,7 @@ def dispatch(conn,send=None,*,dry_run=False,now_fn=lambda:datetime.now(timezone.
                 if match[0] or match[1] or match[2] or selected is None or pressure(selected['home_shots'],selected['away_shots']) is not True:
                     conn.execute("UPDATE live_alert_outbox SET state='expired',reason='no_current_candidate',updated_at=now() WHERE alert_match_id=%s",(job['alert_match_id'],));report['expired']+=1;continue
                 if ambiguous(conn,selected):report['identity_ambiguous']+=1;continue
+                selected['league_goals'] = league_goals_for_signal(conn, selected, now_fn())
                 if deadline-clock()<30:
                     report['time_budget']+=1;break
                 selected['selection_reason']='api_primary' if selected['source']=='api_football' else 'api_missing_stale_or_unknown'

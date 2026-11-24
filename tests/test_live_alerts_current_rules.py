@@ -68,6 +68,11 @@ def test_pressure_window(minute,draw,hit):
     assert (la.build_pressure_alert(live_item(1,minute=minute,home=0,away=0 if draw else 1),{10:{'shots':6}}) is not None)==hit
 
 
+def test_legacy_pressure_ignores_full_match_statistics():
+    body = {'response': [{'team': {'id': 10}, 'statistics': [{'type': 'Shots on Goal', 'value': 9}]}]}
+    assert la.build_pressure_alert(live_item(1, minute=70), la._half_stats_exact(body)) is None
+
+
 @pytest.mark.parametrize("away", [0, 1])
 def test_pressure_no_snapshot_and_no_repeat(tmp_path,monkeypatch,away):
     saved=[]

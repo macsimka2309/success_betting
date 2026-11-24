@@ -90,6 +90,8 @@ class Alert:
     source: str = "half"  # half_shots: «half» — второй тайм, «match» — за матч
     yellow_cards: int | None = None
     extra: tuple = ()  # другие признаки того же матча в этой карточке (Alert)
+    league_season: int | None = None
+    league_goals: dict | None = None
 
     @property
     def categories(self) -> tuple[str, ...]:
@@ -207,6 +209,9 @@ def format_message(alert: Alert) -> str:
         f"Матч: {alert.home} — {alert.away}",
         f"Минута: {alert.minute}' | Счёт: {alert.goals_home}:{alert.goals_away}",
     ]
+    if "half_pressure" in alert.categories:
+        from src.jobs.league_goals import league_goals_line
+        common.insert(1, league_goals_line(alert.league_goals))
     if not alert.extra:
         return "\n".join([f"{header}Тип: {CATEGORY_TITLES[alert.category]}"] + common + _detail_lines(alert))
     cards = (alert,) + tuple(alert.extra)
@@ -334,6 +339,7 @@ def _base_alert(item: dict, side: str, category: str, **fields) -> Alert:
     return Alert(
         fixture_id=int(item["fixture"]["id"]),
         league_id=to_int(league.get("id")),
+        league_season=to_int(league.get("season")),
         league=str(league.get("name") or ""),
         country=str(league.get("country") or ""),
         home=str((teams.get("home") or {}).get("name") or ""),
@@ -618,6 +624,11 @@ def run_live_alerts(
 
         def deliver(alert: Alert) -> bool:
             nonlocal failed_sends
+            if "half_pressure" in alert.categories:
+                from src.jobs.league_goals import league_goals
+                metric = league_goals(conn, fixture_id=alert.fixture_id, league_id=alert.league_id,
+                                      season=alert.league_season, kickoff_at=alert.kickoff_at)
+                alert = replace(alert, league_goals=metric)
             if dry_run:
                 log(f"[dry-run] сработал матч {alert.fixture_id} ({alert.category}):\n{format_message(alert)}")
                 ctx.items_processed += 1
