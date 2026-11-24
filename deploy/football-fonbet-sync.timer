@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Fonbet reconciliation at Moscow midnight with settlement retries
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 Europe/Moscow
+OnCalendar=*-*-* 00:15:00 Europe/Moscow
+OnCalendar=*-*-* 01:00:00 Europe/Moscow
+Persistent=true
+Unit=football-fonbet-sync.service
+
+[Install]
+WantedBy=timers.target
