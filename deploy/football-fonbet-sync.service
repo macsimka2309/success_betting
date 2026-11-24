@@ -1,0 +1,13 @@
+[Unit]
+Description=Read Fonbet history and reconcile football bet registry
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/apps/fonbet-sync-pilot
+ExecStart=/bin/bash /opt/apps/fonbet-sync-pilot/run_fonbet_sync.sh
+TimeoutStartSec=360
+UMask=0077
