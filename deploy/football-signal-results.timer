@@ -1,0 +1,11 @@
+[Unit]
+Description=Review due signal results every minute for late Fonbet observations
+
+[Timer]
+OnCalendar=*-*-* *:*:45 Europe/Moscow
+AccuracySec=1s
+Persistent=true
+Unit=football-signal-results.service
+
+[Install]
+WantedBy=timers.target

@@ -332,3 +332,5 @@ def test_sender_requires_token_and_chat(monkeypatch):
 def _legacy_categories_enabled(monkeypatch):
     """Категории stats/half/half_attack отключены в продакшене (18.10.2026), здесь проверяется их логика."""
     monkeypatch.setattr(la, "ENABLED_CATEGORIES", ("stats", "half", "half_attack"))
+    # Isolate legacy alert tests; persistence is covered by test_live_statistics.
+    monkeypatch.setattr(la, "collect_statistics", lambda *args: {})

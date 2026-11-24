@@ -1,0 +1,15 @@
+[Unit]
+Description=Reconcile a batch of historical Fonbet match mappings
+After=docker.service
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/apps/fonbet-sync-pilot
+StateDirectory=football-fonbet-reconcile
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /opt/apps/fonbet-sync-pilot/live/reconcile.py --backlog-state /var/lib/football-fonbet-reconcile/cursor --apply
+TimeoutStartSec=90
+Nice=10
+UMask=0077

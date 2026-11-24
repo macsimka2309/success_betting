@@ -1,0 +1,14 @@
+[Unit]
+Description=Dispatch saved API-Football and Fonbet live alerts
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/apps/football-collector
+EnvironmentFile=/opt/apps/football-collector/.env
+ExecStart=/opt/apps/football-collector/.venv/bin/python -m src.jobs.alert_dispatch
+TimeoutStartSec=90
+UMask=0077

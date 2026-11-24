@@ -23,6 +23,8 @@ LEAGUE, SEASON, TEAMS = 99, 2026, 10
 def _only_favorite(monkeypatch):
     """Остальные категории здесь не проверяются: запасная проверка half_shots делает лишние запросы."""
     monkeypatch.setattr(la, "ENABLED_CATEGORIES", ("favorite",))
+    # Isolate legacy alert tests; persistence is covered by test_live_statistics.
+    monkeypatch.setattr(la, "collect_statistics", lambda *args: {})
 
 
 def seed_table(conn, league_type="League", teams=TEAMS, season=SEASON):
@@ -141,7 +143,7 @@ def test_places_rounding():
     assert [la.favorite_places(n) for n in (8, 10, 12, 16, 18, 20)] == [2, 2, 2, 3, 4, 4]
 
 
-def test_alert_comes_with_four_bet_buttons(tmp_path, conn):
+def test_alert_comes_with_three_over_buttons(tmp_path, conn):
     seed_table(conn)
     outbox, _ = run(tmp_path, conn, [item(goals=(1, 2))])  # всего 3 гола
     markup = outbox.markups[0]
@@ -150,8 +152,9 @@ def test_alert_comes_with_four_bet_buttons(tmp_path, conn):
         alert_id = cur.fetchone()[0]
     rows = [[(b["text"], b["callback_data"]) for b in row] for row in markup["inline_keyboard"]]
     assert rows == [
-        [("ТБ 3.5", f"bet:{alert_id}:TB:3.5"), ("ТМ 3.5", f"bet:{alert_id}:TM:3.5")],
-        [("ТБ 4.5", f"bet:{alert_id}:TB:4.5"), ("ТМ 4.5", f"bet:{alert_id}:TM:4.5")],
+        [("ТБ 3.5", f"bet:{alert_id}:TB:3.5")],
+        [("ТБ 4.5", f"bet:{alert_id}:TB:4.5")],
+        [("ТБ 5.5", f"bet:{alert_id}:TB:5.5")],
     ]
 
 
@@ -181,7 +184,7 @@ def test_two_features_in_one_run_give_one_card_and_dedupe_both(tmp_path, conn):
         {"team": {"id": 1}, "statistics_2h": [{"type": "Ball Possession", "value": "75%"}, {"type": "Shots on Goal", "value": 3}]},
         {"team": {"id": 10}, "statistics_2h": [{"type": "Ball Possession", "value": "25%"}, {"type": "Shots on Goal", "value": 0}]},
     ]}
-    client = make_client(tmp_path, [{"response": [live]}, {"response": [live]}, exact, {"response": [live]}], max_requests=9)
+    client = make_client(tmp_path, [{"response": [live]}, exact, {"response": [live]}, exact], max_requests=9)
     outbox = Outbox()
     la.run_live_alerts(client, conn, outbox, log=lambda _: None, categories=("favorite", "half_shots"))
     assert len(outbox.messages) == 1 and "Признаки (2):" in outbox.messages[0]

@@ -1,5 +1,5 @@
 """Regression tests: only scripted API and a disposable TEST_DATABASE_URL."""
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -22,7 +22,7 @@ def due(conn):
 
 
 def test_empty_is_delayed_and_does_not_poison_next_response(tmp_path, conn):
-    seed(conn, [(1, date(2026, 10, 31))])
+    seed(conn, [(1, datetime.now(timezone.utc).date())])
     client = make_client(tmp_path, [{'response': []}, full_body()])
     collect.run_statistics(client, conn)
     assert result(conn, 'statistics') == ('empty', 1)
@@ -36,7 +36,7 @@ def test_empty_is_delayed_and_does_not_poison_next_response(tmp_path, conn):
 
 
 def test_empty_exhausts_without_claiming_unsupported(tmp_path, conn):
-    seed(conn, [(1, date(2026, 10, 31))])
+    seed(conn, [(1, datetime.now(timezone.utc).date())])
     client = make_client(tmp_path, [{'response': []}] * 4)
     for _ in range(4):
         collect.run_statistics(client, conn)
@@ -48,7 +48,7 @@ def test_empty_exhausts_without_claiming_unsupported(tmp_path, conn):
 
 
 def test_partial_team_stats_and_halves_are_not_complete(tmp_path, conn):
-    seed(conn, [(1, date(2026, 10, 31))])
+    seed(conn, [(1, datetime.now(timezone.utc).date())])
     body = full_body()
     body['response'] = body['response'][:1]
     collect._process_statistics(make_client(tmp_path, [body]), conn, 1)
@@ -98,7 +98,7 @@ def test_features_depend_on_fresh_and_precede_history(tmp_path, conn, monkeypatc
 
 
 def test_lineups_with_empty_starters_are_not_loaded(tmp_path, conn):
-    seed(conn, [(1, date(2026, 10, 31))])
+    seed(conn, [(1, datetime.now(timezone.utc).date())])
     body = {'response': [{'team': {'id': n}, 'startXI': []} for n in (36, 34)]}
     assert not collect._process_lineups(make_client(tmp_path, [body]), conn, 1)
     assert result(conn, 'lineups') == ('partial', 1)
@@ -134,7 +134,12 @@ def test_feature_failure_prevents_history(tmp_path, conn, monkeypatch):
 def test_new_migration_can_be_reverted_on_empty_test_database(conn):
     from src.db import migrate
     migration = next(m for m in migrate.discover() if m.version == '019')
+    dependents = [m for m in migrate.discover() if m.version > '019']
+    for dependent in reversed(dependents):
+        migrate.revert(conn, dependent)
     migrate.revert(conn, migration)
     assert conn.execute("SELECT to_regclass('api_observations'),to_regclass('fixture_fetch_results')").fetchone() == (None, None)
     migrate.apply(conn, migration)
+    for dependent in dependents:
+        migrate.apply(conn, dependent)
     assert conn.execute("SELECT count(*) FROM api_observations").fetchone()[0] == 0

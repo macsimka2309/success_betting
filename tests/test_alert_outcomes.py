@@ -218,6 +218,6 @@ def test_bot_button_shows_hit_rate(conn):
     assert api.sent[-1][3] is True and "Владение+удары" in api.last and "Итого" in api.last
 
 
-def test_menu_has_hit_rate_button():
+def test_menu_only_offers_registry_report():
     labels = [b["text"] for row in rb.MENU["keyboard"] for b in row]
-    assert rb.MENU_HITS in labels
+    assert labels == [rb.MENU_REPORT]

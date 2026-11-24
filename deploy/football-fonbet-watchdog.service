@@ -1,0 +1,14 @@
+[Unit]
+Description=Fonbet health notifications and bounded recovery
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/apps/football-collector
+EnvironmentFile=/opt/apps/football-collector/.env
+ExecStart=/opt/apps/football-collector/.venv/bin/python -m src.jobs.fonbet_watchdog
+TimeoutStartSec=150
+UMask=0077

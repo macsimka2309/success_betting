@@ -1,0 +1,26 @@
+CREATE TABLE live_match_statistics_75 (
+    fixture_id INTEGER PRIMARY KEY,
+    league_id INTEGER,
+    season INTEGER,
+    kickoff_at TIMESTAMPTZ,
+    home_team_id INTEGER NOT NULL,
+    away_team_id INTEGER NOT NULL,
+    status_short TEXT NOT NULL CHECK (status_short = '2H'),
+    elapsed SMALLINT NOT NULL CHECK (elapsed BETWEEN 65 AND 75),
+    elapsed_extra SMALLINT,
+    goals_home SMALLINT,
+    goals_away SMALLINT,
+    statistics JSONB NOT NULL CHECK (jsonb_typeof(statistics) = 'object'),
+    requested_at TIMESTAMPTZ NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    context_observed_at TIMESTAMPTZ NOT NULL,
+    observation_id BIGINT NOT NULL REFERENCES api_observations(observation_id),
+    context_observation_id BIGINT NOT NULL REFERENCES api_observations(observation_id),
+    run_id BIGINT NOT NULL REFERENCES collection_runs(run_id),
+    minute_basis TEXT NOT NULL CHECK (minute_basis IN ('same_response', 'context')),
+    quality_status TEXT NOT NULL CHECK (quality_status IN ('both_teams', 'partial')),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (home_team_id <> away_team_id),
+    CHECK (requested_at <= observed_at)
+);
+CREATE INDEX live_match_statistics_75_league_idx ON live_match_statistics_75(league_id, season);

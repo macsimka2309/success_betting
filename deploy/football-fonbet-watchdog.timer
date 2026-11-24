@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Fonbet collector every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00 Europe/Moscow
+AccuracySec=1s
+Persistent=false
+Unit=football-fonbet-watchdog.service
+
+[Install]
+WantedBy=timers.target

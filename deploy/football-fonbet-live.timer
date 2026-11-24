@@ -1,0 +1,10 @@
+[Unit]
+Description=Fonbet live statistics every five minutes without overlapping runs
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00 Europe/Moscow
+Persistent=false
+Unit=football-fonbet-live.service
+
+[Install]
+WantedBy=timers.target

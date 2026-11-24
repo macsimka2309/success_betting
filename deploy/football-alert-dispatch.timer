@@ -1,0 +1,11 @@
+[Unit]
+Description=Evaluate saved live observations every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00 Europe/Moscow
+AccuracySec=1s
+Persistent=false
+Unit=football-alert-dispatch.service
+
+[Install]
+WantedBy=timers.target

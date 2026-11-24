@@ -1,10 +1,8 @@
-"""Оповещения по идущим матчам (specs/онлайн-оповещения.md).
+"""Live-опрос и оповещения.
 
-Каждый запуск: один запрос `fixtures?live=all`, отбор кандидатов по минуте,
-затем статистика кандидатов пачками `fixtures?ids=…` (до 20 матчей). Две категории:
-`stats` (владение и удары в створ за матч) и `half` (владение во втором тайме больше 70 %).
-Каждая категория уходит в Telegram по матчу один раз. Снимки матчей не сохраняются,
-кроме владения на перерыве (`live_ht_possession`) — оно нужно для оценки второго тайма.
+На 65–75-й минуте статистика всех матчей сохраняется в одну строку на fixture_id.
+Ответы переиспользуются для проверки сигналов. Сырые ответы сохраняет
+collection_run, подробный контракт — specs/лайв-статистика-на-75-минуте.md.
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ from src.api.client import ApiClient
 from src.common.convert import to_int, to_percent, to_utc
 from src.db.connection import connect, database_url
 from src.jobs.collect import collection_run
+from src.jobs.live_statistics import collect_statistics
 
 LIVE_STATUSES = ("1H", "2H")
 MINUTE_FROM, MINUTE_TO = 60, 75
@@ -29,24 +28,27 @@ POSSESSION_ABOVE = 55
 SHOTS_ON_GOAL_MIN = 6
 HALF_POSSESSION_MIN = 70  # владение во втором тайме не меньше (с 18.10.2026; раньше строго больше)
 HALF_MINUTE_FROM = 65
-SHOTS_POSSESSION_MIN = 70  # категория half_shots: владение не меньше (по таймам и за матч)
-HALF_SHOTS_MIN = 2  # half_shots по таймам: удары в створ во втором тайме не меньше
-MATCH_SHOTS_MIN = 3  # half_shots по статистике за матч (запасной вариант): удары в створ не меньше
+SHOTS_POSSESSION_MIN = 70  # категория half_shots: владение во втором тайме не меньше
+HALF_SHOTS_MIN = 3  # half_shots по таймам: удары в створ во втором тайме не меньше
+HALF_SHOTS_MINUTE_FROM, HALF_SHOTS_MINUTE_TO = 65, 75
+HALF_SHOTS_TOTAL_MIN = 4
 HALF_MAX_LEAD = 1  # команда проигрывает, играет вничью или ведёт не больше чем на мяч
 HALF_PREFILTER = 62  # оценка второго тайма выше этого порога → точный запрос по таймам
 ATTACK_POSSESSION_ABOVE = 55  # категория half_attack: владение во втором тайме строго больше
 ATTACK_SHOTS_MIN = 4  # категория half_attack: удары в створ во втором тайме не меньше
 ATTACK_PREFILTER_POSSESSION = 48  # оценка владения для отбора кандидатов half_attack
 FIRST_HALF_MINUTES = 45
-ENABLED_CATEGORIES = ("half_shots",)  # остальные отключены: stats/half/half_attack 18.10, favorite 28.10.2026
-LEGACY_CATEGORIES = ("stats", "half", "half_attack", "half_shots")
+ENABLED_CATEGORIES = ("half_pressure",)
+LEGACY_CATEGORIES = ("stats", "half", "half_attack")
 FAVORITE_MINUTE_FROM, FAVORITE_MINUTE_TO = 65, 75
 FAVORITE_SHARE = 0.2  # верхние и нижние 20 % таблицы
 MIN_TEAMS = 8
 MIN_PLAYED = 5
 IDS_BATCH = 20
-DEFAULT_MAX_REQUESTS = 30
+DEFAULT_MAX_REQUESTS = 150
 CATEGORY_TITLES = {
+    "half_pressure": "удары в створ во 2-м тайме",
+    "yellow_cards": "жёлтые карточки за матч",
     "stats": "владение и удары в створ",
     "half": "владение во 2-м тайме",
     "half_attack": "атака во 2-м тайме",
@@ -85,8 +87,11 @@ class Alert:
     teams_count: int | None = None
     home_points: int | None = None  # только для сообщения, в базе не хранятся
     away_points: int | None = None
-    source: str = "half"  # half_shots: «half» — статистика второго тайма, «match» — запасная, за матч
+    source: str = "half"  # half_shots: «half» — второй тайм, «match» — за матч
+    yellow_cards: int | None = None
     extra: tuple = ()  # другие признаки того же матча в этой карточке (Alert)
+    league_season: int | None = None
+    league_goals: dict | None = None
 
     @property
     def categories(self) -> tuple[str, ...]:
@@ -169,18 +174,24 @@ def build_alert(item: dict) -> Alert | None:
 
 
 def _detail_lines(alert: Alert) -> list[str]:
+    if alert.category == "yellow_cards":
+        return [f"Жёлтые карточки за матч: {alert.yellow_cards}"]
     if alert.category == "favorite":
         return [f"Фаворит: {alert.home} — {alert.home_rank}-е место из {alert.teams_count}, {alert.home_points} оч.",
                 f"Аутсайдер: {alert.away} — {alert.away_rank}-е место, {alert.away_points} оч."]
     role = "хозяева" if alert.team_side == "home" else "гости"
     lines = [f"Команда: {alert.team} ({role})"]
     opponent = "?" if alert.opponent_shots is None else alert.opponent_shots
-    if alert.category == "half":
+    if alert.category == "half_pressure":
+        other = "?" if alert.opponent_shots is None else alert.opponent_shots
+        total = "?" if alert.opponent_shots is None else alert.shots + alert.opponent_shots
+        lines.append(f"Во 2-м тайме: удары в створ {alert.shots} против {other}, суммарно {total}")
+    elif alert.category == "half":
         total = f" (за матч {alert.total_possession} %)" if alert.total_possession is not None else ""
         lines.append(f"Владение во 2-м тайме: {alert.possession} %{total}")
     elif alert.category == "half_shots" and alert.source == "match":
         opp = "?" if alert.opponent_shots is None else alert.opponent_shots
-        lines.append(f"За матч (по таймам данных нет): владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opp})")
+        lines.append(f"За матч: владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opp})")
     elif alert.category == "half_shots":
         lines.append(f"Во 2-м тайме: владение {alert.possession} %, удары в створ {alert.shots} (у соперника {opponent})")
     elif alert.category == "half_attack":
@@ -198,6 +209,9 @@ def format_message(alert: Alert) -> str:
         f"Матч: {alert.home} — {alert.away}",
         f"Минута: {alert.minute}' | Счёт: {alert.goals_home}:{alert.goals_away}",
     ]
+    if "half_pressure" in alert.categories:
+        from src.jobs.league_goals import league_goals_line
+        common.insert(1, league_goals_line(alert.league_goals))
     if not alert.extra:
         return "\n".join([f"{header}Тип: {CATEGORY_TITLES[alert.category]}"] + common + _detail_lines(alert))
     cards = (alert,) + tuple(alert.extra)
@@ -209,15 +223,15 @@ def format_message(alert: Alert) -> str:
 
 
 def bet_keyboard(alert: Alert) -> dict | None:
-    """Кнопки ставок: ТБ и ТМ на «голы сейчас + 0,5» и «голы сейчас + 1,5» (callback `bet:ID:РЫНОК:ЛИНИЯ`)."""
-    if alert.alert_id is None:
+    """Кнопки ставок: ТБ на «голы сейчас + 0,5», «+ 1,5» и «+ 2,5» (callback `bet:ID:РЫНОК:ЛИНИЯ`)."""
+    if alert.alert_id is None or alert.categories == ("yellow_cards",):
         return None
     goals = alert.goals_home + alert.goals_away
     rows = []
-    for shift in (0.5, 1.5):
+    for shift in (0.5, 1.5, 2.5):
         line = f"{goals + shift:.1f}"
         rows.append([{"text": f"{title} {line}", "callback_data": f"bet:{alert.alert_id}:{code}:{line}"}
-                     for code, title in (("TB", "ТБ"), ("TM", "ТМ"))])
+                     for code, title in (("TB", "ТБ"),)])
     return {"inline_keyboard": rows}
 
 
@@ -325,6 +339,7 @@ def _base_alert(item: dict, side: str, category: str, **fields) -> Alert:
     return Alert(
         fixture_id=int(item["fixture"]["id"]),
         league_id=to_int(league.get("id")),
+        league_season=to_int(league.get("season")),
         league=str(league.get("name") or ""),
         country=str(league.get("country") or ""),
         home=str((teams.get("home") or {}).get("name") or ""),
@@ -371,10 +386,15 @@ def _is_draw(item: dict) -> bool:
     return parsed is not None and parsed[1] == parsed[2]
 
 
+def is_half_shots_candidate(item: dict) -> bool:
+    parsed = _score_and_minute(item)
+    return parsed is not None and HALF_SHOTS_MINUTE_FROM <= parsed[0] <= HALF_SHOTS_MINUTE_TO
+
+
 def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
-    """Категория half_shots, правило 1: минута 60–75, во 2-м тайме владение не меньше 70 % и 2+ удара в створ.
+    """Категория half_shots, правило 1: минута 65–75, во 2-м тайме владение ≥70 % и ≥3 ударов в створ у команды или ≥4 суммарно.
     Ничья на момент среза не берётся."""
-    if not is_candidate(item) or _is_draw(item):
+    if not is_half_shots_candidate(item) or _is_draw(item):
         return None
     teams = item.get("teams") or {}
     for side, other in (("home", "away"), ("away", "home")):
@@ -382,26 +402,32 @@ def build_half_shots_alert(item: dict, exact: dict[int, dict], total: dict[str, 
         other_id = to_int((teams.get(other) or {}).get("id"))
         stats = exact.get(team_id) or {}
         possession, shots = stats.get("possession"), stats.get("shots")
-        if possession is None or shots is None or possession < SHOTS_POSSESSION_MIN or shots < HALF_SHOTS_MIN:
+        opponent_shots = (exact.get(other_id) or {}).get("shots")
+        if possession is None or possession < SHOTS_POSSESSION_MIN or shots is None or shots < 0:
+            continue
+        if shots < HALF_SHOTS_MIN and (
+            opponent_shots is None or opponent_shots < 0 or shots + opponent_shots < HALF_SHOTS_TOTAL_MIN
+        ):
             continue
         return _base_alert(item, side, "half_shots", possession=possession, shots=shots,
-                           opponent_shots=(exact.get(other_id) or {}).get("shots"), total_possession=total.get(side))
+                           opponent_shots=opponent_shots, total_possession=total.get(side))
     return None
 
 
-def build_match_shots_alert(item: dict) -> Alert | None:
-    """Категория half_shots, правило 2 (статистики по таймам нет): за матч владение не меньше 70 % и 3+ удара в створ."""
-    if not is_candidate(item) or _is_draw(item):
+def build_pressure_alert(item: dict, exact: dict[int, dict]) -> Alert | None:
+    """65–75, при любом счёте: 8+ суммарно или 6+ у команды за второй тайм."""
+    if not is_half_shots_candidate(item):
         return None
-    possession, shots = _possession_by_side(item), _shots_by_side(item)
-    for side, other in (("home", "away"), ("away", "home")):
-        if possession.get(side) is None or shots.get(side) is None:
-            continue
-        if possession[side] < SHOTS_POSSESSION_MIN or shots[side] < MATCH_SHOTS_MIN:
-            continue
-        return _base_alert(item, side, "half_shots", possession=possession[side], shots=shots[side],
-                           opponent_shots=shots.get(other), total_possession=possession[side], source="match")
-    return None
+    teams = item.get("teams") or {}
+    shots = {side: (exact.get(to_int((teams.get(side) or {}).get("id"))) or {}).get("shots")
+             for side in ("home", "away")}
+    from src.jobs.alert_rules import pressure
+    if pressure(shots["home"], shots["away"]) is not True:
+        return None
+    side = max((side for side in shots if shots[side] is not None and shots[side] >= 0), key=lambda side: shots[side])
+    other = "away" if side == "home" else "home"
+    return _base_alert(item, side, "half_pressure", possession=None, shots=shots[side],
+                       opponent_shots=shots[other])
 
 
 def build_attack_alert(item: dict, exact: dict[int, dict], total: dict[str, int]) -> Alert | None:
@@ -501,7 +527,17 @@ def _already_sent(conn, fixture_ids: list[int], category: str) -> set[int]:
             "SELECT fixture_id FROM live_alerts_sent WHERE fixture_id = ANY(%s) AND (category = %s OR %s = ANY(also_categories))",
             (fixture_ids, category, category),
         )
-        return {row[0] for row in cur.fetchall()}
+        result = {row[0] for row in cur.fetchall()}
+    # Keep the compatibility path safe after a configuration-only rollback.
+    from src.jobs.live_context import available
+    if available(conn):
+        with conn.cursor() as cur:
+            cur.execute("""SELECT a.source_event_id::integer FROM live_alert_aliases a
+              JOIN live_alert_matches m USING(alert_match_id)
+              WHERE a.source='api_football' AND a.source_event_id=ANY(%s)
+               AND (m.sent_at IS NOT NULL OR m.uncertain_at IS NOT NULL)""", ([str(fid) for fid in fixture_ids],))
+            result.update(row[0] for row in cur.fetchall())
+    return result
 
 
 def _reserve_alert_id(conn) -> int:
@@ -578,7 +614,7 @@ def _fetch_by_ids(client: ApiClient, ids: list[int]):
 
 def run_live_alerts(
     client: ApiClient, conn, send: Sender | None, dry_run: bool = False, log: Callable[[str], None] = print,
-    categories: tuple[str, ...] | None = None,
+    categories: tuple[str, ...] | None = None, collect_only: bool = False,
 ):
     """Один запуск. `send` не нужен при dry_run (сообщение пишется в журнал)."""
     categories = ENABLED_CATEGORIES if categories is None else categories
@@ -588,6 +624,11 @@ def run_live_alerts(
 
         def deliver(alert: Alert) -> bool:
             nonlocal failed_sends
+            if "half_pressure" in alert.categories:
+                from src.jobs.league_goals import league_goals
+                metric = league_goals(conn, fixture_id=alert.fixture_id, league_id=alert.league_id,
+                                      season=alert.league_season, kickoff_at=alert.kickoff_at)
+                alert = replace(alert, league_goals=metric)
             if dry_run:
                 log(f"[dry-run] сработал матч {alert.fixture_id} ({alert.category}):\n{format_message(alert)}")
                 ctx.items_processed += 1
@@ -604,6 +645,7 @@ def run_live_alerts(
             return True
 
         pending_cards: dict[int, list[Alert]] = {}
+        exact_cache: dict[int, dict] = {}
 
         def collect(alert: Alert) -> bool:
             """Признаки одного матча за запуск собираются в одну карточку."""
@@ -620,6 +662,13 @@ def run_live_alerts(
                 raise RuntimeError("не удалось получить идущие матчи")
             return ctx
         items = live.get("response") or []
+        context_receipt = client.last_observation
+        from src.jobs.live_context import record_api_context, enabled
+        record_api_context(conn, items, context_receipt)
+        statistics_responses = collect_statistics(client, conn, items, context_receipt, ctx.run_id, log)
+        exact_cache.update({fid: _half_stats_exact(body) for fid, body in statistics_responses.items()})
+        if collect_only or enabled(conn):
+            return ctx
 
         if "favorite" in categories:
             fav = [i for i in items if is_favorite_candidate(i)]
@@ -659,18 +708,9 @@ def run_live_alerts(
             def second_half_pending(fixture_id: int) -> bool:
                 return fixture_id in snapshots and (
                     (on["half"] and fixture_id not in sent["half"])
-                    or (on["half_attack"] and fixture_id not in sent["half_attack"])
-                    or (on["half_shots"] and fixture_id not in sent["half_shots"] and fixture_id not in draws))
+                    or (on["half_attack"] and fixture_id not in sent["half_attack"]))
 
-            draws = {int(i["fixture"]["id"]) for i in candidates if _is_draw(i)}
-
-            def match_stats_pending(fixture_id: int) -> bool:
-                """Нет снимка на перерыве, статистики по таймам не будет: проверяем статистику за матч."""
-                return (on["half_shots"] and fixture_id not in snapshots and fixture_id not in sent["half_shots"]
-                        and fixture_id not in draws)
-
-            need = [i for i in ids if (on["stats"] and i not in sent["stats"]) or second_half_pending(i)
-                    or match_stats_pending(i)]
+            need = [i for i in ids if (on["stats"] and i not in sent["stats"]) or second_half_pending(i)]
             for item in _fetch_by_ids(client, need):
                 fixture_id = int(item["fixture"]["id"])
                 fired = False
@@ -678,16 +718,12 @@ def run_live_alerts(
                     alert = build_alert(item)
                     if alert is not None:
                         fired = collect(alert) or fired
-                if match_stats_pending(fixture_id):
-                    alert = build_match_shots_alert(item)
-                    if alert is not None:
-                        fired = collect(alert) or fired
                 if second_half_pending(fixture_id) and is_candidate(item):
                     minute = _score_and_minute(item)[0]  # type: ignore[index]
                     total = _possession_by_side(item)
                     total_shots = _shots_by_side(item)
                     snap = snapshots[fixture_id]
-                    want_half = want_attack = want_shots = False
+                    want_half = want_attack = False
                     for side in ("home", "away"):
                         first = snap["possession"].get(side)
                         est = estimate_second_half(total[side], first, minute) if side in total and first is not None else None
@@ -695,26 +731,16 @@ def run_live_alerts(
                                 and _lead(item, side) <= HALF_MAX_LEAD and est is not None and est > HALF_PREFILTER):
                             want_half = True
                         shots_first = snap["shots"].get(side)
-                        if (on["half_shots"] and fixture_id not in sent["half_shots"] and fixture_id not in draws
-                                and side in total_shots and shots_first is not None
-                                and total_shots[side] - shots_first >= HALF_SHOTS_MIN
-                                and est is not None and est > HALF_PREFILTER):
-                            want_shots = True
                         if (on["half_attack"] and fixture_id not in sent["half_attack"] and side in total_shots and shots_first is not None
                                 and total_shots[side] - shots_first >= ATTACK_SHOTS_MIN
                                 and (est is None or est > ATTACK_PREFILTER_POSSESSION)):
                             want_attack = True
-                    if (want_half or want_attack or want_shots) and _budget_left(client):
+                    if (want_half or want_attack) and _budget_left(client):
                         body = client.get("/fixtures/statistics", {"fixture": fixture_id, "half": "true"}, use_cache=False)
                         exact = _half_stats_exact(body)
+                        exact_cache[fixture_id] = exact
                         if want_half:
                             alert = build_half_alert(item, exact, total)
-                            if alert is not None:
-                                fired = collect(alert) or fired
-                        if want_shots:
-                            alert = build_half_shots_alert(item, exact, total)
-                            if alert is None and not any(v.get("possession") is not None for v in exact.values()):
-                                alert = build_match_shots_alert(item)  # по таймам данных нет
                             if alert is not None:
                                 fired = collect(alert) or fired
                         if want_attack:
@@ -723,6 +749,47 @@ def run_live_alerts(
                                 fired = collect(alert) or fired
                 if not fired:
                     ctx.skipped += 1
+        half_categories = tuple(c for c in ("half_shots", "half_pressure") if c in categories)
+        if half_categories:
+            candidates = [item for item in items if is_half_shots_candidate(item)]
+            ids = [int(item["fixture"]["id"]) for item in candidates]
+            sent = {c: _already_sent(conn, ids, c) for c in half_categories}
+            for item in candidates:
+                fid = int(item["fixture"]["id"])
+                want_shots = "half_shots" in sent and fid not in sent["half_shots"] and not _is_draw(item)
+                want_pressure = "half_pressure" in sent and fid not in sent["half_pressure"]
+                if not (want_shots or want_pressure):
+                    continue
+                if fid not in exact_cache:
+                    if not _budget_left(client):
+                        break
+                    body = client.get("/fixtures/statistics", {"fixture": fid, "half": "true"}, use_cache=False)
+                    if body is None or body.get("errors"):
+                        continue
+                    exact_cache[fid] = _half_stats_exact(body)
+                exact = exact_cache[fid]
+                if want_shots:
+                    alert = build_half_shots_alert(item, exact, {})
+                    if alert is not None:
+                        collect(alert)
+                if want_pressure:
+                    alert = build_pressure_alert(item, exact)
+                    if alert is not None:
+                        collect(alert)
+        if "yellow_cards" in categories:
+            card_alerts = []
+            for item in items:
+                if not is_half_shots_candidate(item):
+                    continue
+                count = sum(event.get("type") == "Card" and event.get("detail") == "Yellow Card"
+                            for event in item.get("events") or [])
+                if count >= 7:
+                    card_alerts.append(_base_alert(item, "home", "yellow_cards", possession=None,
+                                                  shots=None, opponent_shots=None, yellow_cards=count))
+            sent_cards = _already_sent(conn, [alert.fixture_id for alert in card_alerts], "yellow_cards")
+            for alert in card_alerts:
+                if alert.fixture_id not in sent_cards:
+                    collect(alert)
         flush()
         if failed_sends:
             raise RuntimeError(f"не отправлено оповещений: {failed_sends}")
@@ -732,6 +799,7 @@ def run_live_alerts(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Оповещения по идущим матчам")
     parser.add_argument("--dry-run", action="store_true", help="не отправлять, печатать в журнал")
+    parser.add_argument("--collect-only", action="store_true", help="сохранять live-контекст и срезы без прямой отправки")
     parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
     parser.add_argument("--cache-dir", type=Path, default=Path("cache"))
     args = parser.parse_args(argv)
@@ -741,11 +809,11 @@ def main(argv: list[str] | None = None) -> int:
     if not key:
         print("Не задана переменная окружения APIFOOTBALL_KEY", file=sys.stderr)
         return 1
-    send = None if args.dry_run else telegram_sender_from_env()
+    send = None if args.dry_run or args.collect_only else telegram_sender_from_env()
     client = ApiClient(key=key, cache_dir=args.cache_dir, max_requests=args.max_requests, verbose=False)
     try:
         with connect(url) as conn:
-            ctx = run_live_alerts(client, conn, send, dry_run=args.dry_run)
+            ctx = run_live_alerts(client, conn, send, dry_run=args.dry_run, collect_only=args.collect_only)
     except Exception as exc:
         print(f"ошибка: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

@@ -1,0 +1,15 @@
+[Unit]
+Description=Read Fonbet second-half live shots on target
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/apps/fonbet-sync-pilot
+# Sports-only DB storage after migration and verified live acceptance.
+ExecStart=/bin/bash /opt/apps/fonbet-sync-pilot/run_fonbet_live.sh --apply
+TimeoutStartSec=720
+KillMode=control-group
+UMask=0077

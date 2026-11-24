@@ -1,0 +1,16 @@
+[Unit]
+Description=Review regulation goals after new football signals
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/apps/football-collector
+EnvironmentFile=/opt/apps/football-collector/.env
+ExecStart=/opt/apps/football-collector/.venv/bin/python -m src.jobs.signal_results --scheduled --limit 10 --browser-limit 1
+TimeoutStartSec=150
+Nice=10
+MemoryMax=512M
+UMask=0077

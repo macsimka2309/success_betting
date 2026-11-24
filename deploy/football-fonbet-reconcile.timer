@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile historical Fonbet match mappings every fifteen minutes
+
+[Timer]
+OnCalendar=*-*-* *:4/15:00 Europe/Moscow
+AccuracySec=1s
+Unit=football-fonbet-reconcile.service
+
+[Install]
+WantedBy=timers.target

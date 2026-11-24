@@ -1,0 +1,10 @@
+DROP VIEW live_match_statistics_75_combined;
+DROP TABLE fonbet_fixture_mapping_audit;
+DROP TABLE fonbet_competition_aliases;
+DROP TABLE fonbet_team_aliases;
+ALTER TABLE fonbet_live_match_statistics_75
+ DROP COLUMN home_away_swapped,
+ DROP COLUMN mapping_method,
+ DROP COLUMN mapping_reason,
+ DROP COLUMN mapping_candidates,
+ DROP COLUMN mapped_at;

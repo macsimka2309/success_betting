@@ -22,10 +22,10 @@ MENU_REPORT = "Показать результат"
 MENU_HITS = "Проходимость"
 CANCEL = "Отмена"
 MARKET_TITLES = {"TB": "ТБ", "TM": "ТМ", "ITB1": "ИТБ1", "ITB2": "ИТБ2"}  # названия для записанных ставок
-ALLOWED_MARKETS = ("TB", "TM")  # доступны для выбора; ИТБ1 и ИТБ2 убраны 17.10.2026, ТМ добавлен
+ALLOWED_MARKETS = ("TB",)  # для новых ставок доступны только тоталы больше
 # Кнопки «Внести событие» в меню нет с 22.10.2026: ставки вносятся кнопками под оповещением.
 # Текст «Внести событие» и ввод ID по-прежнему работают как запасной путь.
-MENU = {"keyboard": [[{"text": MENU_REPORT}, {"text": MENU_HITS}]], "resize_keyboard": True}
+MENU = {"keyboard": [[{"text": MENU_REPORT}]], "resize_keyboard": True}
 MARKET_KEYBOARD = {
     "inline_keyboard": [
         [{"text": MARKET_TITLES[code], "callback_data": f"mkt:{code}"} for code in ALLOWED_MARKETS],
@@ -65,29 +65,44 @@ _REPORT_SQL = {
         WHERE m::date >= (now() AT TIME ZONE 'Europe/Moscow')::date - 30
         GROUP BY 1 ORDER BY 1 DESC""",
     "month": """
-        SELECT to_char(m, 'YYYY-MM'), count(*), COALESCE(sum(profit), 0), count(*) FILTER (WHERE status = 'open')
-        FROM (SELECT COALESCE(kickoff_at, created_at) AT TIME ZONE 'Europe/Moscow' AS m, profit, status FROM bets) b
+        SELECT to_char(m, 'YYYY-MM'), count(*), COALESCE(sum(profit), 0),
+               count(*) FILTER (WHERE status = 'open'),
+               COALESCE(sum(stake) FILTER (WHERE status NOT IN ('open', 'void')), 0),
+               count(*) FILTER (WHERE status IN ('won', 'half_won')),
+               count(*) FILTER (WHERE status IN ('won', 'half_won', 'lost', 'half_lost'))
+        FROM (SELECT COALESCE(kickoff_at, created_at) AT TIME ZONE 'Europe/Moscow' AS m,
+                     profit, status, stake FROM bets) b
         WHERE m >= date_trunc('month', (now() AT TIME ZONE 'Europe/Moscow') - interval '11 months')
         GROUP BY 1 ORDER BY 1 DESC""",
 }
 
 
-def report_rows(conn, mode: str) -> list[tuple[str, int, Decimal, int]]:
+def report_rows(conn, mode: str) -> list[tuple]:
     with conn.cursor() as cur:
         cur.execute(_REPORT_SQL[mode])
         return cur.fetchall()
 
 
-def format_report(rows: list[tuple[str, int, Decimal, int]], mode: str) -> str:
+def format_report(rows: list[tuple], mode: str) -> str:
     title = "День" if mode == "day" else "Месяц"
     if not rows:
         return "Ставок за период нет"
     lines = [f"{title:<11}{'Ставок':>8}{'Результат':>12}"]
-    for period, count, result, _open in rows:
-        lines.append(f"{period:<11}{count:>8}{result:>+12.2f}")
-    total_count = sum(r[1] for r in rows)
-    total = sum((r[2] for r in rows), Decimal(0))
-    lines.append(f"{'Итого':<11}{total_count:>8}{total:>+12.2f}")
+    def percent(numerator: Decimal | int, denominator: Decimal | int) -> str:
+        return f"{100 * Decimal(numerator) / denominator:.1f}%" if denominator else "—"
+
+    def line(period, count, result, _open, *metrics):
+        base = f"{period:<11}{count:>8}{result:>+12.2f}"
+        if mode == "month":
+            turnover, won, decided = metrics
+            base += f"{percent(result, turnover):>9}{percent(won, decided):>14}"
+        return base
+
+    if mode == "month":
+        lines[0] += f"{'ROI':>9}{'Проходимость':>14}"
+    lines.extend(line(*row) for row in rows)
+    totals = [sum(column) for column in zip(*(row[1:] for row in rows))]
+    lines.append(line("Итого", *totals))
     text = "<pre>" + html.escape("\n".join(lines)) + "</pre>"
     pending = sum(r[3] for r in rows)
     if pending:
@@ -193,7 +208,7 @@ class Bot:
         elif step == "alert_id":
             self._step_alert_id(text)
         elif step == "market":
-            self.api.send(self.owner, "Выберите рынок кнопкой: ТБ или ТМ", MARKET_KEYBOARD)
+            self.api.send(self.owner, "Выберите рынок кнопкой: ТБ", MARKET_KEYBOARD)
         elif step == "line":
             self._step_line(text, payload)
         elif step == "odds":
